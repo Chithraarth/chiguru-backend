@@ -37,7 +37,12 @@ export * from './farmProfileUpdate';
 export * from './getMonthlyReportParams';
 export * from './getSeasonReportParams';
 export * from './getWeeklyReportParams';
-export * from './getWorkerWagesParams';
+// getWorkerWagesParams intentionally not re-exported here: its type and
+// ../../generated/api's zod schema const share the exact name
+// GetWorkerWagesParams, and re-exporting both via wildcard barrels causes a
+// TS2308 ambiguous-export error. Import directly from
+// './getWorkerWagesParams' if the plain type (rather than the zod schema) is
+// ever needed.
 export * from './harvest';
 export * from './harvestInput';
 export * from './harvestUpdate';
