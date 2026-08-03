@@ -403,9 +403,10 @@ router.get("/estates", requireOwnerOrManager, async (req, res) => {
   return res.json(rows);
 });
 
-// No free estate — creating even the first one requires an active
-// subscription. Once active, the plan's own allowance (or unlimited) applies,
-// scoped to THIS Owner, not a global count shared by every farmer.
+// One free estate so a new farmer can try the app with real data; an active
+// subscription is required for a second estate onward. Once active, the
+// plan's own allowance (or unlimited) applies, scoped to THIS Owner, not a
+// global count shared by every farmer.
 async function maxEstatesForOwner(ownerId: number): Promise<number> {
   const [sub] = await db
     .select()
@@ -413,7 +414,7 @@ async function maxEstatesForOwner(ownerId: number): Promise<number> {
     .where(eq(subscriptionsTable.ownerId, ownerId))
     .orderBy(desc(subscriptionsTable.id))
     .limit(1);
-  if (!sub || sub.status !== "active") return 0;
+  if (!sub || sub.status !== "active") return 1;
   const plan = Object.values(PLANS).find((p) => p.name === sub.planName);
   return plan?.maxEstates ?? Infinity;
 }
@@ -442,20 +443,23 @@ router.post("/estates", requireOwner, async (req, res) => {
   return res.status(201).json(row);
 });
 
-router.patch("/estates/:id", async (req, res) => {
+router.patch("/estates/:id", requireOwner, async (req, res) => {
   const [row] = await db
     .update(farmProfileTable)
     .set({ ...req.body, updatedAt: new Date() })
-    .where(eq(farmProfileTable.id, Number(req.params.id)))
+    .where(and(eq(farmProfileTable.id, Number(req.params.id)), eq(farmProfileTable.ownerId, req.owner!.id)))
     .returning();
   if (!row) return res.status(404).json({ message: "Not found" });
   return res.json(row);
 });
 
-router.delete("/estates/:id", async (req, res) => {
+router.delete("/estates/:id", requireOwner, async (req, res) => {
   const id = Number(req.params.id);
   // Never allow deleting the last estate — the app always needs an active estate.
-  const all = await db.select({ id: farmProfileTable.id }).from(farmProfileTable);
+  const all = await db
+    .select({ id: farmProfileTable.id })
+    .from(farmProfileTable)
+    .where(eq(farmProfileTable.ownerId, req.owner!.id));
   if (all.length <= 1) {
     return res.status(400).json({ message: "Cannot delete the last estate" });
   }
@@ -535,11 +539,6 @@ router.get("/farm/profile", async (req, res) => {
     .limit(1);
   if (rows.length === 0) return res.status(404).json({ message: "Not found" });
   return res.json(rows[0]);
-});
-
-router.post("/farm/profile", async (req, res) => {
-  const [row] = await db.insert(farmProfileTable).values(req.body).returning();
-  return res.status(201).json(row);
 });
 
 router.patch("/farm/profile", async (req, res) => {
