@@ -417,7 +417,8 @@ async function maxEstatesForOwner(ownerId: number): Promise<number> {
     .limit(1);
   if (!sub || sub.status !== "active") return 1;
   const plan = Object.values(PLANS).find((p) => p.name === sub.planName);
-  return plan?.maxEstates ?? Infinity;
+  if (!plan) return 1 + sub.extraEstates;
+  return (plan.maxEstates ?? Infinity) + sub.extraEstates;
 }
 
 router.post("/estates", requireOwner, async (req, res) => {

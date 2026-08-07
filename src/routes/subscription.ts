@@ -1,8 +1,8 @@
 import { Router, type IRouter, type Request, type Response } from "express";
 import { eq, desc } from "drizzle-orm";
-import { db, subscriptionsTable, paymentsTable } from "../db";
+import { db, subscriptionsTable, paymentsTable, ownersTable } from "../db";
 import { requireOwner } from "../middlewares/firebaseAuth";
-import { stripe, PLANS, planById, MANAGER_SEAT_ADDON } from "../lib/stripe";
+import { stripe, PLANS, planById, ESTATE_ADDON, MANAGER_DEVICE_ADDON, inlinePrice } from "../lib/stripe";
 import { logger } from "../lib/logger";
 import type Stripe from "stripe";
 
@@ -11,6 +11,9 @@ const router: IRouter = Router();
 // Where Stripe Checkout sends the farmer back after payment. Point this at
 // whatever domain is actually serving the app.
 const APP_URL = process.env.PUBLIC_APP_URL ?? "https://thechiguru.com";
+
+const SHARE_PLATFORMS = ["whatsapp", "facebook", "x", "telegram", "other"];
+const SHARE_TARGET = 3;
 
 async function latestSubscription(ownerId: number) {
   const [sub] = await db
@@ -34,11 +37,17 @@ async function getOrCreateStripeCustomer(ownerId: number, email: string | null):
 }
 
 router.get("/subscription/plans", (_req, res) => {
-  res.json({ plans: Object.values(PLANS), managerSeatAddon: MANAGER_SEAT_ADDON });
+  res.json({ plans: Object.values(PLANS), estateAddon: ESTATE_ADDON, managerDeviceAddon: MANAGER_DEVICE_ADDON });
 });
 
 router.get("/subscription", requireOwner, async (req, res) => {
-  res.json(await latestSubscription(req.owner!.id));
+  const sub = await latestSubscription(req.owner!.id);
+  res.json({
+    subscription: sub,
+    sharePlatforms: req.owner!.sharePlatforms,
+    shareRewardClaimedAt: req.owner!.shareRewardClaimedAt,
+    freeMonthPending: req.owner!.freeMonthPending,
+  });
 });
 
 router.get("/payments", requireOwner, async (req, res) => {
@@ -52,7 +61,8 @@ router.get("/payments", requireOwner, async (req, res) => {
 
 // Owner picks a plan — new subscription, upgrade, or downgrade all go through
 // the same Checkout Session; which one it is doesn't matter until the webhook
-// confirms payment and we activate it.
+// confirms payment and we activate it. A share-to-earn reward earned while not
+// yet subscribed rides along as a 30-day trial on this same checkout.
 router.post("/subscription/checkout", requireOwner, async (req, res) => {
   const { planId } = req.body as { planId?: string };
   const plan = planId ? planById(planId) : undefined;
@@ -60,17 +70,15 @@ router.post("/subscription/checkout", requireOwner, async (req, res) => {
     res.status(400).json({ message: "Unknown plan", code: "INVALID_PLAN" });
     return;
   }
-  if (!plan.stripePriceId) {
-    res.status(500).json({ message: "This plan isn't configured in Stripe yet", code: "PLAN_NOT_CONFIGURED" });
-    return;
-  }
 
   const customerId = await getOrCreateStripeCustomer(req.owner!.id, req.owner!.email);
+  const freeMonthPending = req.owner!.freeMonthPending;
 
   const session = await stripe.checkout.sessions.create({
     mode: "subscription",
     customer: customerId,
-    line_items: [{ price: plan.stripePriceId, quantity: 1 }],
+    line_items: [{ price_data: inlinePrice(plan.amount, `Chiguru ${plan.name} plan`), quantity: 1 }],
+    subscription_data: freeMonthPending ? { trial_period_days: 30 } : undefined,
     success_url: `${APP_URL}/subscription/success?session_id={CHECKOUT_SESSION_ID}`,
     cancel_url: `${APP_URL}/subscription`,
     metadata: { ownerId: String(req.owner!.id), kind: "plan", planId: plan.id },
@@ -79,32 +87,89 @@ router.post("/subscription/checkout", requireOwner, async (req, res) => {
   res.json({ url: session.url });
 });
 
-// Additional manager seats, billed as their own Stripe subscription line so
-// they can be purchased independently of (and outlive) a plan change.
-router.post("/subscription/seats/checkout", requireOwner, async (req, res) => {
-  const { seats } = req.body as { seats?: number };
-  const quantity = Number(seats);
-  if (!Number.isInteger(quantity) || quantity < 1) {
-    res.status(400).json({ message: "seats must be a positive integer", code: "INVALID_SEATS" });
-    return;
-  }
-  if (!MANAGER_SEAT_ADDON.stripePriceId) {
-    res.status(500).json({ message: "Manager seat add-on isn't configured in Stripe yet", code: "ADDON_NOT_CONFIGURED" });
-    return;
-  }
-
+// Extra estate on top of the plan's bundled allowance — its own Stripe
+// subscription line so it renews independently of the main plan.
+router.post("/subscription/estate-addon/checkout", requireOwner, async (req, res) => {
   const customerId = await getOrCreateStripeCustomer(req.owner!.id, req.owner!.email);
 
   const session = await stripe.checkout.sessions.create({
     mode: "subscription",
     customer: customerId,
-    line_items: [{ price: MANAGER_SEAT_ADDON.stripePriceId, quantity }],
+    line_items: [{ price_data: inlinePrice(ESTATE_ADDON.amount, "Chiguru estate add-on"), quantity: 1 }],
     success_url: `${APP_URL}/subscription/success?session_id={CHECKOUT_SESSION_ID}`,
     cancel_url: `${APP_URL}/subscription`,
-    metadata: { ownerId: String(req.owner!.id), kind: "seats", seats: String(quantity) },
+    metadata: { ownerId: String(req.owner!.id), kind: "estate_addon" },
   });
 
   res.json({ url: session.url });
+});
+
+// Extra manager device on top of the plan's bundled allowance.
+router.post("/subscription/device-addon/checkout", requireOwner, async (req, res) => {
+  const customerId = await getOrCreateStripeCustomer(req.owner!.id, req.owner!.email);
+
+  const session = await stripe.checkout.sessions.create({
+    mode: "subscription",
+    customer: customerId,
+    line_items: [{ price_data: inlinePrice(MANAGER_DEVICE_ADDON.amount, "Chiguru manager device add-on"), quantity: 1 }],
+    success_url: `${APP_URL}/subscription/success?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${APP_URL}/subscription`,
+    metadata: { ownerId: String(req.owner!.id), kind: "device_addon" },
+  });
+
+  res.json({ url: session.url });
+});
+
+// Share on 3 different apps → 1 month free. Recorded one platform at a time;
+// once 3 distinct platforms have been shared and the reward hasn't already
+// been claimed, it's granted immediately — as a Stripe balance credit if
+// already subscribed (offsets the next invoice), or as a pending flag that
+// turns the NEXT plan checkout into a 30-day free trial otherwise.
+router.post("/subscription/share", requireOwner, async (req, res) => {
+  const { platform } = req.body as { platform?: string };
+  if (!platform || !SHARE_PLATFORMS.includes(platform)) {
+    res.status(400).json({ message: "Unknown share platform", code: "INVALID_PLATFORM" });
+    return;
+  }
+
+  const owner = req.owner!;
+  const shared = new Set((owner.sharePlatforms ?? "").split(",").filter(Boolean));
+  shared.add(platform);
+  const sharePlatforms = Array.from(shared).join(",");
+
+  let rewardGranted = false;
+  const updates: Partial<typeof owner> = { sharePlatforms };
+
+  if (!owner.shareRewardClaimedAt && shared.size >= SHARE_TARGET) {
+    const sub = await latestSubscription(owner.id);
+    if (sub?.status === "active" && sub.stripeCustomerId) {
+      const plan = Object.values(PLANS).find((p) => p.name === sub.planName);
+      const amount = plan?.amount ?? Number(sub.amount);
+      try {
+        await stripe.customers.createBalanceTransaction(sub.stripeCustomerId, {
+          amount: -Math.round(amount * 100),
+          currency: "inr",
+          description: "Chiguru share-to-earn reward: 1 month free",
+        });
+      } catch (err) {
+        logger.error({ err, ownerId: owner.id }, "Failed to apply share-to-earn balance credit");
+        res.status(502).json({ message: "Couldn't apply your reward right now — try again shortly.", code: "REWARD_FAILED" });
+        return;
+      }
+    } else {
+      updates.freeMonthPending = true;
+    }
+    updates.shareRewardClaimedAt = new Date();
+    rewardGranted = true;
+  }
+
+  const [updated] = await db.update(ownersTable).set(updates).where(eq(ownersTable.id, owner.id)).returning();
+  res.json({
+    sharePlatforms: updated.sharePlatforms,
+    shareRewardClaimedAt: updated.shareRewardClaimedAt,
+    freeMonthPending: updated.freeMonthPending,
+    rewardGranted,
+  });
 });
 
 router.post("/subscription/cancel-autorenew", requireOwner, async (req, res) => {
@@ -204,7 +269,7 @@ async function handleCheckoutCompleted(session: Stripe.Checkout.Session) {
           stripeSubscriptionId: stripeSubscriptionId ?? existing.stripeSubscriptionId,
           startDate: now.toISOString().slice(0, 10),
           renewalDate: addOneMonth(now),
-          managerSeats: plan.managerSeats,
+          managerSeats: plan.maxManagerDevices,
           updatedAt: now,
         })
         .where(eq(subscriptionsTable.id, existing.id));
@@ -220,16 +285,25 @@ async function handleCheckoutCompleted(session: Stripe.Checkout.Session) {
         stripeSubscriptionId,
         startDate: now.toISOString().slice(0, 10),
         renewalDate: addOneMonth(now),
-        managerSeats: plan.managerSeats,
+        managerSeats: plan.maxManagerDevices,
       });
     }
-  } else if (kind === "seats") {
-    const seats = Number(session.metadata?.seats ?? 0);
+    // The free-month reward (if any) was consumed as this checkout's trial.
+    await db.update(ownersTable).set({ freeMonthPending: false }).where(eq(ownersTable.id, ownerId));
+  } else if (kind === "estate_addon") {
     const existing = await latestSubscription(ownerId);
-    if (existing && seats > 0) {
+    if (existing) {
       await db
         .update(subscriptionsTable)
-        .set({ managerSeats: existing.managerSeats + seats, updatedAt: new Date() })
+        .set({ extraEstates: existing.extraEstates + 1, updatedAt: new Date() })
+        .where(eq(subscriptionsTable.id, existing.id));
+    }
+  } else if (kind === "device_addon") {
+    const existing = await latestSubscription(ownerId);
+    if (existing) {
+      await db
+        .update(subscriptionsTable)
+        .set({ managerSeats: existing.managerSeats + 1, updatedAt: new Date() })
         .where(eq(subscriptionsTable.id, existing.id));
     }
   }

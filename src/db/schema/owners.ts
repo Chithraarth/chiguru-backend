@@ -6,6 +6,7 @@ import {
   integer,
   timestamp,
   date,
+  boolean,
   uniqueIndex,
 } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
@@ -30,6 +31,14 @@ export const ownersTable = pgTable("owners", {
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
   lastLogin: timestamp("last_login").notNull().defaultNow(),
+  // ── Share-to-earn referral (share on 3 different apps → 1 month free) ──────
+  // Comma-separated platform ids the owner has shared to (whatsapp,facebook,x,telegram,other).
+  sharePlatforms: text("share_platforms"),
+  shareRewardClaimedAt: timestamp("share_reward_claimed_at"),
+  // Set true the moment the reward is earned while NOT yet subscribed — the
+  // next plan checkout applies a 30-day Stripe trial instead of charging
+  // immediately, then cleared once that checkout completes.
+  freeMonthPending: boolean("free_month_pending").notNull().default(false),
 });
 
 export const insertOwnerSchema = createInsertSchema(ownersTable).omit({
@@ -56,7 +65,11 @@ export const subscriptionsTable = pgTable("subscriptions", {
   stripeSubscriptionId: text("stripe_subscription_id"),
   startDate: date("start_date"),
   renewalDate: date("renewal_date"),
+  // Bundled + purchased manager-device allowance (plan's bundled amount plus
+  // any manager-device add-on purchases stacked on top).
   managerSeats: integer("manager_seats").notNull().default(0),
+  // Purchased estate add-ons stacked on top of the plan's bundled estate allowance.
+  extraEstates: integer("extra_estates").notNull().default(0),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });

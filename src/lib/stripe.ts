@@ -11,43 +11,47 @@ export interface Plan {
   name: string;
   amount: number; // INR, per billing cycle
   billingCycle: "monthly";
+  tagline: string;
   /** null = unlimited estates */
   maxEstates: number | null;
-  managerSeats: number;
-  /** Set once the matching Stripe Price is created in the Dashboard. */
-  stripePriceId: string | undefined;
+  /** Manager devices bundled with this plan (before any add-on purchases). */
+  maxManagerDevices: number;
 }
 
-// Price IDs come from env vars (created once in the Stripe Dashboard against
-// these same plans) rather than being hardcoded, since they differ between
-// Stripe's test mode and live mode.
+// Three simple, honest plans (plus a 30-day free trial of full features).
+// Every plan unlocks EVERYTHING — attendance, work updates, expenses, harvest,
+// profit & loss, Agri Doctor consults and selling on Chiguru — and bundles
+// estates and manager devices. The tiers differ only in how many of each:
+//   • Farmer — ₹399/month: 2 estates, 2 manager devices.
+//   • Planter — ₹699/month: 5 estates, 5 manager devices.
+//   • Company Estate — ₹999/month: unlimited estates, 5 manager devices.
 export const PLANS: Record<string, Plan> = {
-  basic: {
-    id: "basic",
-    name: "Basic",
-    amount: 499,
+  farmer: {
+    id: "farmer",
+    name: "Farmer",
+    amount: 399,
     billingCycle: "monthly",
-    maxEstates: 1,
-    managerSeats: 0,
-    stripePriceId: process.env.STRIPE_PRICE_BASIC,
+    tagline: "Attendance + AI count, advances + loans, profit/loss, Agri Doctor, sell + works offline.",
+    maxEstates: 2,
+    maxManagerDevices: 2,
   },
-  premium: {
-    id: "premium",
-    name: "Premium",
+  planter: {
+    id: "planter",
+    name: "Planter",
+    amount: 699,
+    billingCycle: "monthly",
+    tagline: "Everything in Farmer, for a growing plantation with more estates and devices.",
+    maxEstates: 5,
+    maxManagerDevices: 5,
+  },
+  company: {
+    id: "company",
+    name: "Company Estate",
     amount: 999,
     billingCycle: "monthly",
+    tagline: "For companies and large estates — unlimited estates included.",
     maxEstates: null,
-    managerSeats: 2,
-    stripePriceId: process.env.STRIPE_PRICE_PREMIUM,
-  },
-  enterprise: {
-    id: "enterprise",
-    name: "Enterprise",
-    amount: 1999,
-    billingCycle: "monthly",
-    maxEstates: null,
-    managerSeats: 10,
-    stripePriceId: process.env.STRIPE_PRICE_ENTERPRISE,
+    maxManagerDevices: 5,
   },
 };
 
@@ -55,8 +59,21 @@ export function planById(id: string): Plan | undefined {
   return PLANS[id];
 }
 
-/** One additional manager seat, billed monthly alongside the plan. */
-export const MANAGER_SEAT_ADDON = {
-  amount: 199,
-  stripePriceId: process.env.STRIPE_PRICE_MANAGER_SEAT,
-};
+/** Extra estate on top of any plan's bundled allowance. */
+export const ESTATE_ADDON = { amount: 199 };
+/** Extra manager device on top of any plan's bundled allowance. */
+export const MANAGER_DEVICE_ADDON = { amount: 199 };
+
+/**
+ * Inline recurring price for a Stripe subscription-mode Checkout Session —
+ * avoids needing a Price object pre-created in the Stripe Dashboard for every
+ * plan/add-on, so a rename or price change here takes effect immediately.
+ */
+export function inlinePrice(amount: number, productName: string): Stripe.Checkout.SessionCreateParams.LineItem.PriceData {
+  return {
+    currency: "inr",
+    unit_amount: Math.round(amount * 100),
+    recurring: { interval: "month" },
+    product_data: { name: productName },
+  };
+}
