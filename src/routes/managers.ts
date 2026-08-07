@@ -1,31 +1,14 @@
 import { Router, type IRouter } from "express";
 import { eq, and, desc, sql } from "drizzle-orm";
-import { db, subscriptionsTable, managersTable } from "../db";
+import { db, managersTable } from "../db";
 import { requireOwner } from "../middlewares/firebaseAuth";
 import { firebaseAuth } from "../lib/firebase-admin";
 import { logger } from "../lib/logger";
+import { canCreateManager } from "../services/entitlement.service";
 
 const router: IRouter = Router();
 
 const PHONE_RE = /^\+[1-9]\d{7,14}$/;
-
-async function purchasedSeats(ownerId: number): Promise<number> {
-  const [sub] = await db
-    .select({ managerSeats: subscriptionsTable.managerSeats })
-    .from(subscriptionsTable)
-    .where(eq(subscriptionsTable.ownerId, ownerId))
-    .orderBy(desc(subscriptionsTable.id))
-    .limit(1);
-  return sub?.managerSeats ?? 0;
-}
-
-async function activeSeatsUsed(ownerId: number): Promise<number> {
-  const [row] = await db
-    .select({ count: sql<number>`count(*)::int` })
-    .from(managersTable)
-    .where(and(eq(managersTable.ownerId, ownerId), eq(managersTable.status, "active")));
-  return row?.count ?? 0;
-}
 
 // List every manager this Owner has ever added (pending/active/removed), newest first.
 router.get("/managers", requireOwner, async (req, res) => {
@@ -54,10 +37,9 @@ router.post("/managers", requireOwner, async (req, res) => {
     return;
   }
 
-  const [seats, used] = await Promise.all([purchasedSeats(req.owner!.id), activeSeatsUsed(req.owner!.id)]);
-  if (used >= seats) {
+  if (!(await canCreateManager(req.owner!.id))) {
     res.status(403).json({
-      message: "You've used all your purchased manager seats. Buy more seats from Subscription to add another manager.",
+      message: "Your current subscription does not have enough Manager seats.",
       code: "NO_SEATS_AVAILABLE",
     });
     return;

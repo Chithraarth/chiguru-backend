@@ -3,7 +3,7 @@ import cors from "cors";
 import compression from "compression";
 import pinoHttp from "pino-http";
 import { firebaseAuthMiddleware } from "./middlewares/firebaseAuth";
-import { stripeWebhookHandler } from "./routes/subscription";
+import { razorpayWebhookHandler } from "./routes/subscription";
 import router from "./routes";
 import { logger } from "./lib/logger";
 
@@ -34,10 +34,10 @@ app.use(cors({ credentials: true, origin: true }));
 // going to farmers on slow rural connections.
 app.use(compression());
 
-// Stripe needs the exact raw request bytes to verify a webhook's signature, so
-// this must be mounted with express.raw() BEFORE the global express.json()
+// Razorpay needs the exact raw request bytes to verify a webhook's signature,
+// so this must be mounted with express.raw() BEFORE the global express.json()
 // below (which would otherwise consume/parse the body first).
-app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), stripeWebhookHandler);
+app.post("/api/webhooks/razorpay", express.raw({ type: "application/json" }), razorpayWebhookHandler);
 
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true, limit: "20mb" }));

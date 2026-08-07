@@ -27,7 +27,6 @@ import {
   userDevicesTable,
   planTasksTable,
 } from "../db/schema";
-import { subscriptionsTable } from "../db/schema";
 import { openai } from "../integrations-openai-ai-server";
 import { requestOwnerKey, bodyOwnerKey } from "../lib/owner-key";
 import { sendSuggestionEmail } from "../lib/gmail";
@@ -35,7 +34,7 @@ import { eq, and, or, gte, lte, lt, sql, desc, inArray, isNull, isNotNull } from
 import type { PgColumn } from "drizzle-orm/pg-core";
 import { requireOwner, requireOwnerOrManager, effectiveOwnerId } from "../middlewares/firebaseAuth";
 import { requireActiveSubscription } from "../middlewares/subscriptionGate";
-import { PLANS } from "../lib/stripe";
+import { getMaxEstates } from "../services/entitlement.service";
 
 const router = Router();
 
@@ -404,30 +403,13 @@ router.get("/estates", requireOwnerOrManager, async (req, res) => {
   return res.json(rows);
 });
 
-// One free estate so a new farmer can try the app with real data; an active
-// subscription is required for a second estate onward. Once active, the
-// plan's own allowance (or unlimited) applies, scoped to THIS Owner, not a
-// global count shared by every farmer.
-async function maxEstatesForOwner(ownerId: number): Promise<number> {
-  const [sub] = await db
-    .select()
-    .from(subscriptionsTable)
-    .where(eq(subscriptionsTable.ownerId, ownerId))
-    .orderBy(desc(subscriptionsTable.id))
-    .limit(1);
-  if (!sub || sub.status !== "active") return 1;
-  const plan = Object.values(PLANS).find((p) => p.name === sub.planName);
-  if (!plan) return 1 + sub.extraEstates;
-  return (plan.maxEstates ?? Infinity) + sub.extraEstates;
-}
-
 router.post("/estates", requireOwner, async (req, res) => {
   const [countRow] = await db
     .select({ count: sql<number>`count(*)::int` })
     .from(farmProfileTable)
     .where(eq(farmProfileTable.ownerId, req.owner!.id));
   const estateCount = countRow?.count ?? 0;
-  const maxEstates = await maxEstatesForOwner(req.owner!.id);
+  const maxEstates = await getMaxEstates(req.owner!.id);
   if (estateCount >= maxEstates) {
     return res.status(403).json({
       message: maxEstates === 0

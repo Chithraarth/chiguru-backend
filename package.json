@@ -25,7 +25,7 @@
     "pg": "^8.20.0",
     "pino": "^9.14.0",
     "pino-http": "^10.5.0",
-    "stripe": "^17.4.0",
+    "razorpay": "^2.9.8",
     "zod": "^3.25.76"
   },
   "devDependencies": {
