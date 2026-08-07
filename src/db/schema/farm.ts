@@ -31,6 +31,8 @@ export const farmProfileTable = pgTable("farm_profile", {
   ownerId: integer("owner_id").references(() => ownersTable.id),
   // Farmer's contact phone, shown/edited in My Profile (used for callbacks/support).
   contactPhone: text("contact_phone"),
+  // Second contact number (e.g. a family member's), optional.
+  alternatePhone: text("alternate_phone"),
   // Location/size are optional: a planter can add a secondary estate with just a
   // name and fill in GPS/village/acres later. Only the name is required.
   latitude: numeric("latitude", { precision: 10, scale: 6 }),
@@ -138,6 +140,13 @@ export const workGroupsTable = pgTable("work_groups", {
   seasonSummary: text("season_summary"),
   // Payee handle of the group contractor/maistry for direct payments.
   upiId: text("upi_id"),
+  // How often pending overtime / picking bonus gets manually settled - purely
+  // informational, shown on the summary card ("weekly" | "monthly" | "daily").
+  overtimeSettlement: text("overtime_settlement").notNull().default("weekly"),
+  harvestBonusSettlement: text("harvest_bonus_settlement").notNull().default("weekly"),
+  // Picking-bonus rule for this group: bonus per day = max(0, kg - threshold) * bonusPerKg.
+  harvestThresholdKg: numeric("harvest_threshold_kg", { precision: 8, scale: 2 }),
+  harvestBonusPerKg: numeric("harvest_bonus_per_kg", { precision: 8, scale: 2 }),
   isActive: boolean("is_active").notNull().default(true),
   // Soft delete → recycle bin. Non-null means "in the bin"; restorable for 30
   // days, then purged (with children) lazily by the bin endpoints.
@@ -180,8 +189,13 @@ export const groupAdvancePaymentsTable = pgTable("group_advance_payments", {
   advancePerWorkerPerDay: numeric("advance_per_worker_per_day", { precision: 10, scale: 2 }).notNull(),
   totalAdvancePaid: numeric("total_advance_paid", { precision: 10, scale: 2 }).notNull(),
   notes: text("notes"),
+  // Idempotency key for the overtime/harvest-bonus "settle" actions, which
+  // write a ledger row here - a retried settle must not double-record the payout.
+  clientId: text("client_id"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
-});
+}, (t) => ({
+  clientIdUnique: uniqueIndex("group_advance_payments_client_id_unique").on(t.clientId),
+}));
 
 export const attendanceTable = pgTable("attendance", {
   id: serial("id").primaryKey(),
@@ -194,6 +208,16 @@ export const attendanceTable = pgTable("attendance", {
   date: date("date").notNull(),
   hoursWorked: numeric("hours_worked", { precision: 5, scale: 2 }).notNull(),
   wageAmount: numeric("wage_amount", { precision: 10, scale: 2 }).notNull(),
+  // Overtime is folded into wageAmount by the client already - these two are
+  // kept purely for display and settlement tracking (overtime-summary/settle).
+  overtimeHours: numeric("overtime_hours", { precision: 5, scale: 2 }),
+  overtimeRate: numeric("overtime_rate", { precision: 10, scale: 2 }),
+  overtimePaidAt: timestamp("overtime_paid_at"),
+  // Kg picked (harvest-picking work groups). Any over-threshold bonus is
+  // already folded into wageAmount by the client, same convention as overtime.
+  harvestedKg: numeric("harvested_kg", { precision: 8, scale: 2 }),
+  harvestCrop: text("harvest_crop"),
+  harvestBonusPaidAt: timestamp("harvest_bonus_paid_at"),
   notes: text("notes"),
   // Label of the device/person who last wrote this row (e.g. "Owner" or a
   // manager's name). Used for last-write-wins conflict logging across devices.
@@ -741,6 +765,51 @@ export const workerPaymentsTable = pgTable("worker_payments", {
 }, (t) => ({
   clientIdUnique: uniqueIndex("worker_payments_client_id_unique").on(t.clientId),
 }));
+
+// ── Year Plan: AI-generated (or manually added) 12-month task calendar ─────────
+export const planTasksTable = pgTable("plan_tasks", {
+  id: serial("id").primaryKey(),
+  estateId: integer("estate_id").references(() => farmProfileTable.id),
+  cropId: integer("crop_id").references(() => cropsTable.id),
+  month: text("month").notNull(), // "YYYY-MM"
+  day: integer("day"), // day of month, null = whole month
+  title: text("title").notNull(),
+  details: text("details"),
+  category: text("category").notNull().default("other"), // fertilizer|spray|irrigation|pruning|harvest|other
+  done: boolean("done").notNull().default(false),
+  source: text("source").notNull().default("manual"), // "manual" | "ai"
+  // Idempotency key for offline-queued creates.
+  clientId: text("client_id"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+}, (t) => ({
+  clientIdUnique: uniqueIndex("plan_tasks_client_id_unique").on(t.clientId),
+}));
+
+export type PlanTask = typeof planTasksTable.$inferSelect;
+export const insertPlanTaskSchema = createInsertSchema(planTasksTable).omit({ id: true, createdAt: true });
+export type InsertPlanTask = z.infer<typeof insertPlanTaskSchema>;
+
+// ── Push notifications (Expo push tokens) ───────────────────────────────────
+// One row per installed app instance. The monthly Year Plan reminder sweep
+// (routes/push.ts) reads these; markers make each trigger once-per-month
+// idempotent no matter how often the sweep runs.
+export const pushDevicesTable = pgTable("push_devices", {
+  id: serial("id").primaryKey(),
+  estateId: integer("estate_id").references(() => farmProfileTable.id),
+  deviceId: text("device_id").notNull(),
+  expoPushToken: text("expo_push_token").notNull(),
+  // Opt-in to the extra mid-month (days 15-19) nudge, on top of the
+  // always-on month-start (days 1-5) reminder.
+  midmonthEnabled: boolean("midmonth_enabled").notNull().default(true),
+  lastNotifiedMonth: text("last_notified_month"), // "YYYY-MM"
+  lastMidmonthNotifiedMonth: text("last_midmonth_notified_month"),
+  lastSentAt: timestamp("last_sent_at"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+}, (t) => ({
+  tokenUnique: uniqueIndex("push_devices_token_unique").on(t.expoPushToken),
+}));
+
+export type PushDevice = typeof pushDevicesTable.$inferSelect;
 
 export const insertFarmProfileSchema = createInsertSchema(farmProfileTable).omit({ id: true, createdAt: true, updatedAt: true });
 export const insertCropSchema = createInsertSchema(cropsTable).omit({ id: true, createdAt: true });

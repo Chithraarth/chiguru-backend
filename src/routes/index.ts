@@ -12,11 +12,15 @@ import managersRouter from "./managers";
 import errorsRouter from "./errors";
 import ownersRouter from "./owners";
 import subscriptionRouter from "./subscription";
+import yearPlanRouter from "./year-plan";
+import pushRouter from "./push";
 
 const router: IRouter = Router();
 
 router.use(healthRouter);
 router.use(farmRouter);
+router.use(yearPlanRouter);
+router.use(pushRouter);
 router.use(openaiRouter);
 router.use(agriDoctorRouter);
 router.use(marketplaceRouter);

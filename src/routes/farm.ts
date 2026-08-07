@@ -25,6 +25,7 @@ import {
   mandiDailyPricesTable,
   mandiFetchLogTable,
   userDevicesTable,
+  planTasksTable,
 } from "../db/schema";
 import { subscriptionsTable } from "../db/schema";
 import { openai } from "../integrations-openai-ai-server";
@@ -443,11 +444,15 @@ router.post("/estates", requireOwner, async (req, res) => {
   return res.status(201).json(row);
 });
 
-router.patch("/estates/:id", requireOwner, async (req, res) => {
+// A manager acting for their linked owner may rename the estate too (e.g.
+// from the manager app's estate switcher) - scoped by the owner they're
+// actually linked to, same as every other manager-writable resource.
+router.patch("/estates/:id", requireOwnerOrManager, async (req, res) => {
+  const ownerId = effectiveOwnerId(req);
   const [row] = await db
     .update(farmProfileTable)
     .set({ ...req.body, updatedAt: new Date() })
-    .where(and(eq(farmProfileTable.id, Number(req.params.id)), eq(farmProfileTable.ownerId, req.owner!.id)))
+    .where(and(eq(farmProfileTable.id, Number(req.params.id)), eq(farmProfileTable.ownerId, ownerId!)))
     .returning();
   if (!row) return res.status(404).json({ message: "Not found" });
   return res.json(row);
@@ -605,6 +610,43 @@ router.delete("/crops/:id", async (req, res) => {
     .delete(cropsTable)
     .where(estateScoped(cropsTable.id, cropsTable.estateId, Number(req.params.id), eid));
   return res.status(204).end();
+});
+
+// Merges a duplicate crop's records (blocks, work groups, expenses, sprays,
+// harvests, plan tasks) into another crop, then deletes the source crop.
+router.post("/crops/:id/merge", async (req, res) => {
+  const eid = await activeEstateId(req);
+  const sourceId = Number(req.params.id);
+  const intoId = Number(req.body?.intoId);
+  if (!Number.isInteger(sourceId) || !Number.isInteger(intoId)) {
+    return res.status(400).json({ message: "intoId is required" });
+  }
+  if (sourceId === intoId) {
+    return res.status(400).json({ message: "Cannot merge a crop into itself" });
+  }
+  // Both rows must exist and belong to the active estate - client-supplied ids
+  // must never re-parent data across estates.
+  const rows = await db
+    .select({ id: cropsTable.id })
+    .from(cropsTable)
+    .where(
+      and(
+        inArray(cropsTable.id, [sourceId, intoId]),
+        eid != null ? eq(cropsTable.estateId, eid) : undefined,
+      ),
+    );
+  if (rows.length !== 2) return res.status(404).json({ message: "Not found" });
+
+  await db.transaction(async (tx) => {
+    await tx.update(blocksTable).set({ cropId: intoId }).where(eq(blocksTable.cropId, sourceId));
+    await tx.update(workGroupsTable).set({ cropId: intoId }).where(eq(workGroupsTable.cropId, sourceId));
+    await tx.update(expensesTable).set({ cropId: intoId }).where(eq(expensesTable.cropId, sourceId));
+    await tx.update(spraysTable).set({ cropId: intoId }).where(eq(spraysTable.cropId, sourceId));
+    await tx.update(harvestsTable).set({ cropId: intoId }).where(eq(harvestsTable.cropId, sourceId));
+    await tx.update(planTasksTable).set({ cropId: intoId }).where(eq(planTasksTable.cropId, sourceId));
+    await tx.delete(cropsTable).where(eq(cropsTable.id, sourceId));
+  });
+  return res.json({ merged: true, sourceId, intoId });
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -867,6 +909,9 @@ router.get("/work-groups", async (req, res) => {
       targetQuantity: workGroupsTable.targetQuantity,
       targetUnit: workGroupsTable.targetUnit,
       notes: workGroupsTable.notes,
+      loanTaken: workGroupsTable.loanTaken,
+      loanNotes: workGroupsTable.loanNotes,
+      upiId: workGroupsTable.upiId,
       isActive: workGroupsTable.isActive,
       createdAt: workGroupsTable.createdAt,
     })
@@ -1193,6 +1238,160 @@ router.delete("/work-groups/:id/advance-payments/:payId", async (req, res) => {
   return res.status(204).end();
 });
 
+// Overtime money status for a group: pending (not yet paid out) vs cleared.
+// Falls back to the group's day-rate/8 (or hourly rate) when a row predates
+// having its own overtimeRate.
+router.get("/work-groups/:id/overtime-summary", async (req, res) => {
+  const groupId = Number(req.params.id);
+  const eid = await activeEstateId(req);
+  if (!(await groupInEstate(groupId, eid))) {
+    return res.status(404).json({ message: "Not found" });
+  }
+  const [grp] = await db.select().from(workGroupsTable).where(eq(workGroupsTable.id, groupId));
+  const rows = await db
+    .select({ h: attendanceTable.overtimeHours, r: attendanceTable.overtimeRate, paidAt: attendanceTable.overtimePaidAt })
+    .from(attendanceTable)
+    .where(and(eq(attendanceTable.workGroupId, groupId), isNotNull(attendanceTable.overtimeHours)));
+  const fallbackRate = grp ? (grp.paymentType === "Per hour" ? Number(grp.rate) : Number(grp.rate) / 8) : 0;
+  let pendingHours = 0, pendingAmount = 0, clearedAmount = 0;
+  for (const row of rows) {
+    const amt = Number(row.h ?? 0) * (Number(row.r ?? 0) || fallbackRate);
+    if (row.paidAt) clearedAmount += amt;
+    else { pendingHours += Number(row.h ?? 0); pendingAmount += amt; }
+  }
+  return res.json({
+    overtimeSettlement: grp?.overtimeSettlement ?? "weekly",
+    pendingHours,
+    pendingAmount: Math.round(pendingAmount * 100) / 100,
+    clearedAmount: Math.round(clearedAmount * 100) / 100,
+  });
+});
+
+// Manually mark all pending overtime for a group as paid out.
+router.post("/work-groups/:id/overtime/settle", async (req, res) => {
+  const groupId = Number(req.params.id);
+  const eid = await activeEstateId(req);
+  if (!(await groupInEstate(groupId, eid))) {
+    return res.status(404).json({ message: "Not found" });
+  }
+  const rawClientId = req.body?.clientId;
+  const clientId = typeof rawClientId === "string" && rawClientId.trim() !== "" ? rawClientId : null;
+
+  // Idempotent replay: a double tap or offline retry re-sends the same
+  // clientId. If the payout ledger row for this clientId already exists, the
+  // settle already ran - return the stored result without touching anything.
+  if (clientId) {
+    const [existing] = await db.select().from(groupAdvancePaymentsTable)
+      .where(and(eq(groupAdvancePaymentsTable.clientId, clientId), eq(groupAdvancePaymentsTable.workGroupId, groupId)))
+      .limit(1);
+    if (existing) return res.json({ clearedCount: 0, clearedAmount: Number(existing.totalAdvancePaid) });
+  }
+
+  const [grp] = await db.select().from(workGroupsTable).where(eq(workGroupsTable.id, groupId));
+  const { clearedCount, amount } = await db.transaction(async (tx) => {
+    const cleared = await tx
+      .update(attendanceTable)
+      .set({ overtimePaidAt: new Date() })
+      .where(and(eq(attendanceTable.workGroupId, groupId), isNotNull(attendanceTable.overtimeHours), isNull(attendanceTable.overtimePaidAt)))
+      .returning({ h: attendanceTable.overtimeHours, r: attendanceTable.overtimeRate });
+    const fallbackRate = grp ? (grp.paymentType === "Per hour" ? Number(grp.rate) : Number(grp.rate) / 8) : 0;
+    const amt = Math.round(cleared.reduce((s, c) => s + Number(c.h ?? 0) * (Number(c.r ?? 0) || fallbackRate), 0) * 100) / 100;
+    if (amt > 0) {
+      const insert = tx.insert(groupAdvancePaymentsTable).values({
+        workGroupId: groupId,
+        paymentDate: new Date().toISOString().slice(0, 10),
+        periodLabel: "Overtime payout",
+        daysCount: 1,
+        workerCount: 1,
+        advancePerWorkerPerDay: String(amt),
+        totalAdvancePaid: String(amt),
+        notes: "Overtime marked as paid",
+        clientId,
+      });
+      if (clientId) await insert.onConflictDoNothing({ target: groupAdvancePaymentsTable.clientId });
+      else await insert;
+    }
+    return { clearedCount: cleared.length, amount: amt };
+  });
+  return res.json({ clearedCount, clearedAmount: amount });
+});
+
+// Picking-bonus money status for a group: pending (not yet paid out) vs
+// cleared. Bonus per day = max(0, kg - threshold) * bonusPerKg from the
+// group's current rule; rows with kg but no rule contribute 0.
+router.get("/work-groups/:id/harvest-bonus-summary", async (req, res) => {
+  const groupId = Number(req.params.id);
+  const eid = await activeEstateId(req);
+  if (!(await groupInEstate(groupId, eid))) {
+    return res.status(404).json({ message: "Not found" });
+  }
+  const [grp] = await db.select().from(workGroupsTable).where(eq(workGroupsTable.id, groupId));
+  const threshold = Number(grp?.harvestThresholdKg ?? 0);
+  const perKg = Number(grp?.harvestBonusPerKg ?? 0);
+  const rows = await db
+    .select({ kg: attendanceTable.harvestedKg, paidAt: attendanceTable.harvestBonusPaidAt })
+    .from(attendanceTable)
+    .where(and(eq(attendanceTable.workGroupId, groupId), isNotNull(attendanceTable.harvestedKg)));
+  let pendingKg = 0, pendingAmount = 0, clearedAmount = 0;
+  for (const r of rows) {
+    const amt = threshold > 0 && perKg > 0 ? Math.max(0, Number(r.kg ?? 0) - threshold) * perKg : 0;
+    if (r.paidAt) clearedAmount += amt;
+    else { pendingKg += Number(r.kg ?? 0); pendingAmount += amt; }
+  }
+  return res.json({
+    harvestBonusSettlement: grp?.harvestBonusSettlement ?? "weekly",
+    pendingKg,
+    pendingAmount: Math.round(pendingAmount * 100) / 100,
+    clearedAmount: Math.round(clearedAmount * 100) / 100,
+  });
+});
+
+// Manually mark all pending picking bonus for a group as paid out.
+router.post("/work-groups/:id/harvest-bonus/settle", async (req, res) => {
+  const groupId = Number(req.params.id);
+  const eid = await activeEstateId(req);
+  if (!(await groupInEstate(groupId, eid))) {
+    return res.status(404).json({ message: "Not found" });
+  }
+  const rawClientId = req.body?.clientId;
+  const clientId = typeof rawClientId === "string" && rawClientId.trim() !== "" ? rawClientId : null;
+  if (clientId) {
+    const [existing] = await db.select().from(groupAdvancePaymentsTable)
+      .where(and(eq(groupAdvancePaymentsTable.clientId, clientId), eq(groupAdvancePaymentsTable.workGroupId, groupId)))
+      .limit(1);
+    if (existing) return res.json({ clearedCount: 0, clearedAmount: Number(existing.totalAdvancePaid) });
+  }
+  const [grp] = await db.select().from(workGroupsTable).where(eq(workGroupsTable.id, groupId));
+  const threshold = Number(grp?.harvestThresholdKg ?? 0);
+  const perKg = Number(grp?.harvestBonusPerKg ?? 0);
+  const { clearedCount, amount } = await db.transaction(async (tx) => {
+    const cleared = await tx
+      .update(attendanceTable)
+      .set({ harvestBonusPaidAt: new Date() })
+      .where(and(eq(attendanceTable.workGroupId, groupId), isNotNull(attendanceTable.harvestedKg), isNull(attendanceTable.harvestBonusPaidAt)))
+      .returning({ kg: attendanceTable.harvestedKg });
+    const amt = threshold > 0 && perKg > 0
+      ? Math.round(cleared.reduce((s, c) => s + Math.max(0, Number(c.kg ?? 0) - threshold) * perKg, 0) * 100) / 100
+      : 0;
+    if (amt > 0) {
+      const insert = tx.insert(groupAdvancePaymentsTable).values({
+        workGroupId: groupId,
+        paymentDate: new Date().toISOString().slice(0, 10),
+        periodLabel: "Picking bonus payout",
+        daysCount: 1,
+        workerCount: 1,
+        advancePerWorkerPerDay: String(amt),
+        totalAdvancePaid: String(amt),
+        notes: "Picking bonus marked as paid",
+        clientId,
+      });
+      if (clientId) await insert.onConflictDoNothing({ target: groupAdvancePaymentsTable.clientId });
+      else await insert;
+    }
+    return { clearedCount: cleared.length, amount: amt };
+  });
+  return res.json({ clearedCount, clearedAmount: amount });
+});
 
 // ── Direct worker/group payments ─────────────────────────────────────────────
 // The owner's own ledger of payments made to labourers (cash / UPI / wallet /
@@ -1478,7 +1677,11 @@ router.get("/attendance", requireActiveSubscription, async (req, res) => {
       workerName: workersTable.name,
       date: attendanceTable.date,
       hoursWorked: attendanceTable.hoursWorked,
+      overtimeHours: attendanceTable.overtimeHours,
+      overtimeRate: attendanceTable.overtimeRate,
       wageAmount: attendanceTable.wageAmount,
+      harvestedKg: attendanceTable.harvestedKg,
+      harvestCrop: attendanceTable.harvestCrop,
       notes: attendanceTable.notes,
       createdAt: attendanceTable.createdAt,
     })
@@ -1513,7 +1716,16 @@ router.post("/attendance", requireActiveSubscription, async (req, res) => {
       : null;
   const incoming = {
     hoursWorked: String(b.hoursWorked ?? "0"),
+    // Overtime pay and picking bonus are already folded into wageAmount by
+    // the client - these fields are kept purely for display/settlement.
+    overtimeHours: b.overtimeHours != null && Number(b.overtimeHours) > 0 ? String(b.overtimeHours) : null,
+    overtimeRate:
+      b.overtimeHours != null && Number(b.overtimeHours) > 0 && b.overtimeRate != null && Number(b.overtimeRate) > 0
+        ? String(b.overtimeRate)
+        : null,
     wageAmount: String(b.wageAmount ?? "0"),
+    harvestedKg: b.harvestedKg != null && Number(b.harvestedKg) > 0 ? String(b.harvestedKg) : null,
+    harvestCrop: typeof b.harvestCrop === "string" && b.harvestCrop.trim() !== "" ? b.harvestCrop.trim() : null,
     notes: typeof b.notes === "string" && b.notes.trim() !== "" ? b.notes : null,
   };
 
@@ -1539,6 +1751,9 @@ router.post("/attendance", requireActiveSubscription, async (req, res) => {
     const changed =
       Number(existing.hoursWorked) !== Number(incoming.hoursWorked) ||
       Number(existing.wageAmount) !== Number(incoming.wageAmount) ||
+      Number(existing.overtimeHours ?? 0) !== Number(incoming.overtimeHours ?? 0) ||
+      Number(existing.overtimeRate ?? 0) !== Number(incoming.overtimeRate ?? 0) ||
+      Number(existing.harvestedKg ?? 0) !== Number(incoming.harvestedKg ?? 0) ||
       (existing.notes ?? null) !== incoming.notes;
     // Identical re-send = a harmless at-least-once replay, not a real conflict.
     if (!changed) return res.status(200).json(existing);
@@ -1559,6 +1774,8 @@ router.post("/attendance", requireActiveSubscription, async (req, res) => {
       previousValue: {
         hoursWorked: String(existing.hoursWorked),
         wageAmount: String(existing.wageAmount),
+        overtimeHours: existing.overtimeHours != null ? String(existing.overtimeHours) : null,
+        harvestedKg: existing.harvestedKg != null ? String(existing.harvestedKg) : null,
         notes: existing.notes ?? null,
       },
       newValue: incoming,
@@ -2694,6 +2911,226 @@ router.get("/reports/weekly", requireActiveSubscription, async (req, res) => {
     totalExpenses,
     netProfit: totalIncome - totalExpenses,
     days,
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Old Ledger — year-by-year historical summary for years before the current one
+// ──────────────────────────────────────────────────────────────────────────────
+
+// One row per past year with rolled-up totals. Detail rows are served per-year
+// by GET /ledger/old-years/:year below.
+router.get("/ledger/old-years", requireActiveSubscription, async (req, res) => {
+  const eid = await activeEstateId(req);
+  const curYear = new Date().getFullYear();
+  const cutoff = `${curYear}-01-01`;
+
+  const yearOf = (col: PgColumn) => sql<string>`substr(${col}::text, 1, 4)`;
+
+  const [expByYear, harvByYear, attByYear, payByYear, advByYear, loanByYear] = await Promise.all([
+    db.select({
+      year: yearOf(expensesTable.date).as("year"),
+      total: sql<string>`coalesce(sum(${expensesTable.amount}), 0)`,
+    }).from(expensesTable)
+      .where(and(lt(expensesTable.date, cutoff), eid != null ? eq(expensesTable.estateId, eid) : undefined))
+      .groupBy(sql`year`),
+    db.select({
+      year: yearOf(harvestsTable.date).as("year"),
+      total: sql<string>`coalesce(sum(${harvestsTable.totalIncome}), 0)`,
+    }).from(harvestsTable)
+      .where(and(lt(harvestsTable.date, cutoff), eid != null ? eq(harvestsTable.estateId, eid) : undefined))
+      .groupBy(sql`year`),
+    db.select({
+      year: yearOf(attendanceTable.date).as("year"),
+      total: sql<string>`coalesce(sum(${attendanceTable.wageAmount}), 0)`,
+      days: sql<string>`count(*)`,
+      workerCount: sql<string>`count(distinct ${attendanceTable.workerId})`,
+    }).from(attendanceTable)
+      .where(and(
+        lt(attendanceTable.date, cutoff),
+        eid != null ? inArray(attendanceTable.workGroupId, estateGroupIds(eid)) : undefined,
+      ))
+      .groupBy(sql`year`),
+    db.select({
+      year: yearOf(workerPaymentsTable.paymentDate).as("year"),
+      total: sql<string>`coalesce(sum(${workerPaymentsTable.amount}), 0)`,
+    }).from(workerPaymentsTable)
+      .where(and(lt(workerPaymentsTable.paymentDate, cutoff), eid != null ? eq(workerPaymentsTable.estateId, eid) : undefined))
+      .groupBy(sql`year`),
+    db.select({
+      year: yearOf(groupAdvancePaymentsTable.paymentDate).as("year"),
+      total: sql<string>`coalesce(sum(${groupAdvancePaymentsTable.totalAdvancePaid}), 0)`,
+    }).from(groupAdvancePaymentsTable)
+      .where(and(
+        lt(groupAdvancePaymentsTable.paymentDate, cutoff),
+        eid != null ? inArray(groupAdvancePaymentsTable.workGroupId, estateGroupIds(eid)) : undefined,
+      ))
+      .groupBy(sql`year`),
+    db.select({
+      year: yearOf(loansTable.issuedDate).as("year"),
+      total: sql<string>`coalesce(sum(${loansTable.amount}), 0)`,
+    }).from(loansTable)
+      .where(and(lt(loansTable.issuedDate, cutoff), eid != null ? eq(loansTable.estateId, eid) : undefined))
+      .groupBy(sql`year`),
+  ]);
+
+  type Totals = { expenses: number; income: number; wages: number; attendanceDays: number; workerCount: number; payments: number; advances: number; loansGiven: number };
+  const years = new Map<number, Totals>();
+  const totals = (yearStr: string): Totals => {
+    const y = Number(yearStr);
+    let t = years.get(y);
+    if (!t) {
+      t = { expenses: 0, income: 0, wages: 0, attendanceDays: 0, workerCount: 0, payments: 0, advances: 0, loansGiven: 0 };
+      years.set(y, t);
+    }
+    return t;
+  };
+  for (const r of expByYear) totals(r.year).expenses += Number(r.total);
+  for (const r of harvByYear) totals(r.year).income += Number(r.total);
+  for (const r of attByYear) {
+    const t = totals(r.year);
+    t.wages += Number(r.total);
+    t.attendanceDays += Number(r.days);
+    t.workerCount += Number(r.workerCount);
+  }
+  for (const r of payByYear) totals(r.year).payments += Number(r.total);
+  for (const r of advByYear) totals(r.year).advances += Number(r.total);
+  for (const r of loanByYear) totals(r.year).loansGiven += Number(r.total);
+
+  const out = [...years.entries()]
+    .sort((a, b) => b[0] - a[0])
+    .map(([year, t]) => ({ year, totals: t }));
+
+  return res.json(out);
+});
+
+// Full detail for a single past year: expense list + by-category rollup,
+// harvests, per-worker attendance totals, per-work-type wage totals, and every
+// payment/advance/loan row issued that year.
+router.get("/ledger/old-years/:year", requireActiveSubscription, async (req, res) => {
+  const eid = await activeEstateId(req);
+  const curYear = new Date().getFullYear();
+  const year = Number(req.params.year);
+  if (!Number.isInteger(year) || year < 1900 || year >= curYear) {
+    return res.status(400).json({ message: "Invalid year" });
+  }
+  const from = `${year}-01-01`;
+  const to = `${year + 1}-01-01`;
+  const inYear = (col: PgColumn) => and(gte(col, from), lt(col, to));
+
+  const [expenses, expenseCategories, harvests, workers, workTypes, payments, advances, loans] = await Promise.all([
+    db.select({
+      date: expensesTable.date,
+      category: expensesTable.category,
+      amount: expensesTable.amount,
+      description: expensesTable.description,
+    }).from(expensesTable)
+      .where(and(inYear(expensesTable.date), eid != null ? eq(expensesTable.estateId, eid) : undefined))
+      .orderBy(desc(expensesTable.date)),
+    // Expenses rolled up by category (fertiliser, spray, fuel...): the "where
+    // did the money go" view the owner asks for first.
+    db.select({
+      category: expensesTable.category,
+      total: sql<string>`coalesce(sum(${expensesTable.amount}), 0)`,
+      count: sql<string>`count(*)`,
+    }).from(expensesTable)
+      .where(and(inYear(expensesTable.date), eid != null ? eq(expensesTable.estateId, eid) : undefined))
+      .groupBy(expensesTable.category)
+      .orderBy(sql`coalesce(sum(${expensesTable.amount}), 0) desc`),
+    db.select({
+      date: harvestsTable.date,
+      cropName: cropsTable.name,
+      weightKg: harvestsTable.weightKg,
+      totalIncome: harvestsTable.totalIncome,
+      buyer: harvestsTable.buyer,
+    }).from(harvestsTable)
+      .leftJoin(cropsTable, eq(harvestsTable.cropId, cropsTable.id))
+      .where(and(inYear(harvestsTable.date), eid != null ? eq(harvestsTable.estateId, eid) : undefined))
+      .orderBy(desc(harvestsTable.date)),
+    // Attendance rolls up per worker for the year in SQL (day-level rows would be huge).
+    // Grouped by worker id - two workers sharing a name must stay separate rows.
+    db.select({
+      name: sql<string | null>`max(${workersTable.name})`,
+      days: sql<string>`count(*)`,
+      earned: sql<string>`coalesce(sum(${attendanceTable.wageAmount}), 0)`,
+    }).from(attendanceTable)
+      .leftJoin(workersTable, eq(attendanceTable.workerId, workersTable.id))
+      .where(and(
+        inYear(attendanceTable.date),
+        eid != null ? inArray(attendanceTable.workGroupId, estateGroupIds(eid)) : undefined,
+      ))
+      .groupBy(attendanceTable.workerId)
+      .orderBy(sql`coalesce(sum(${attendanceTable.wageAmount}), 0) desc`),
+    // Wages by work type: per work group for the year - category of work, daily
+    // rate, how many works (person-days), how many people, and wages earned.
+    db.select({
+      name: sql<string | null>`max(${workGroupsTable.name})`,
+      category: sql<string | null>`max(${workGroupsTable.category})`,
+      rate: sql<string | null>`max(${workGroupsTable.rate}::text)`,
+      paymentType: sql<string | null>`max(${workGroupsTable.paymentType})`,
+      days: sql<string>`count(*)`,
+      workers: sql<string>`count(distinct coalesce(${attendanceTable.workerId}::text, ${workersTable.name}, '?'))`,
+      wages: sql<string>`coalesce(sum(${attendanceTable.wageAmount}), 0)`,
+    }).from(attendanceTable)
+      .leftJoin(workersTable, eq(attendanceTable.workerId, workersTable.id))
+      .leftJoin(workGroupsTable, eq(attendanceTable.workGroupId, workGroupsTable.id))
+      .where(and(
+        inYear(attendanceTable.date),
+        eid != null ? inArray(attendanceTable.workGroupId, estateGroupIds(eid)) : undefined,
+      ))
+      .groupBy(attendanceTable.workGroupId)
+      .orderBy(sql`coalesce(sum(${attendanceTable.wageAmount}), 0) desc`),
+    db.select({
+      date: workerPaymentsTable.paymentDate,
+      payeeName: workerPaymentsTable.payeeName,
+      amount: workerPaymentsTable.amount,
+      method: workerPaymentsTable.method,
+    }).from(workerPaymentsTable)
+      .where(and(inYear(workerPaymentsTable.paymentDate), eid != null ? eq(workerPaymentsTable.estateId, eid) : undefined))
+      .orderBy(desc(workerPaymentsTable.paymentDate)),
+    db.select({
+      date: groupAdvancePaymentsTable.paymentDate,
+      groupName: workGroupsTable.name,
+      amount: groupAdvancePaymentsTable.totalAdvancePaid,
+      notes: groupAdvancePaymentsTable.notes,
+    }).from(groupAdvancePaymentsTable)
+      .leftJoin(workGroupsTable, eq(groupAdvancePaymentsTable.workGroupId, workGroupsTable.id))
+      .where(and(
+        inYear(groupAdvancePaymentsTable.paymentDate),
+        eid != null ? inArray(groupAdvancePaymentsTable.workGroupId, estateGroupIds(eid)) : undefined,
+      ))
+      .orderBy(desc(groupAdvancePaymentsTable.paymentDate)),
+    db.select({
+      date: loansTable.issuedDate,
+      workerName: workersTable.name,
+      amount: loansTable.amount,
+      totalDue: loansTable.totalDue,
+      repaidAmount: loansTable.repaidAmount,
+      status: loansTable.status,
+    }).from(loansTable)
+      .leftJoin(workersTable, eq(loansTable.workerId, workersTable.id))
+      .where(and(inYear(loansTable.issuedDate), eid != null ? eq(loansTable.estateId, eid) : undefined))
+      .orderBy(desc(loansTable.issuedDate)),
+  ]);
+
+  return res.json({
+    year,
+    expenses,
+    expenseCategories: expenseCategories.map((c) => ({ category: c.category, total: Number(c.total), count: Number(c.count) })),
+    harvests,
+    workers: workers.map((w) => ({ name: w.name ?? "Unknown", days: Number(w.days), earned: Number(w.earned) })),
+    workTypes: workTypes.map((g) => ({
+      name: g.name ?? "No group",
+      category: g.category,
+      rate: g.rate != null ? Number(g.rate) : null,
+      paymentType: g.paymentType,
+      days: Number(g.days),
+      workers: Number(g.workers),
+      wages: Number(g.wages),
+    })),
+    payments,
+    advances,
+    loans,
   });
 });
 
