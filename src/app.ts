@@ -3,7 +3,7 @@ import cors from "cors";
 import compression from "compression";
 import pinoHttp from "pino-http";
 import { firebaseAuthMiddleware } from "./middlewares/firebaseAuth";
-import { razorpayWebhookHandler } from "./routes/subscription";
+import { razorpayWebhookHandler, googlePlayWebhookHandler } from "./routes/subscription";
 import router from "./routes";
 import { logger } from "./lib/logger";
 
@@ -41,6 +41,10 @@ app.post("/api/webhooks/razorpay", express.raw({ type: "application/json" }), ra
 
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true, limit: "20mb" }));
+
+// Google Play's Pub/Sub push has no signature header to verify against raw
+// bytes (unlike Razorpay above) — a normal parsed JSON body is fine here.
+app.post("/api/webhooks/google-play", googlePlayWebhookHandler);
 
 // Verifies a Firebase ID token if present and attaches req.owner — never
 // blocks by itself (see requireOwner for routes that must be signed in).

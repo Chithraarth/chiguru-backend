@@ -27,6 +27,10 @@ export const subscriptionPlansTable = pgTable("subscription_plans", {
   billingPeriod: text("billing_period").notNull().default("monthly"),
   managerLimit: integer("manager_limit").notNull(),
   razorpayPlanId: text("razorpay_plan_id"),
+  // Unlike Razorpay plans (created lazily via API), Play Billing subscription
+  // products/base plans can only be created by hand in Play Console —
+  // Monetization → Subscriptions — then the product id is pasted in here.
+  googlePlayProductId: text("google_play_product_id"),
   active: boolean("active").notNull().default(true),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),

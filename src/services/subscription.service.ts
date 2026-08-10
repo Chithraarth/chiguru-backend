@@ -11,6 +11,7 @@ import {
   type SubscriptionPlan,
 } from "../db";
 import { razorpay, ensureRazorpayPlanId, totalCountForPeriod, verifyCheckoutSignature } from "../lib/razorpay";
+import { fetchSubscriptionState, acknowledgePurchase, decodePubSubMessage } from "../lib/google-play";
 import { getCurrentSubscription, isSubStatusActiveLike } from "./entitlement.service";
 import { logger } from "../lib/logger";
 
@@ -147,6 +148,20 @@ export async function cancel(ownerId: number): Promise<Subscription> {
   if (!sub || !sub.providerSubscriptionId || !isSubStatusActiveLike(sub.status)) {
     throw new SubscriptionServiceError(404, "NO_ACTIVE_SUBSCRIPTION", "No active subscription to cancel.");
   }
+
+  if (sub.provider === "GOOGLE_PLAY") {
+    // Google's own guidance: don't cancel on the user's behalf via the
+    // Developer API — send them to Play Store's subscription management UI,
+    // which handles proration/refund correctly. The RTDN webhook (see
+    // handleGooglePlayNotification) is what actually updates our row once
+    // they cancel there.
+    throw new SubscriptionServiceError(
+      409,
+      "MANAGE_VIA_GOOGLE_PLAY",
+      "Manage this subscription from Google Play — it wasn't started through this screen.",
+    );
+  }
+
   // cancelAtCycleEnd=true: access continues until the current billing period
   // ends — the actual status flip to CANCELLED/EXPIRED happens via webhook.
   await razorpay.subscriptions.cancel(sub.providerSubscriptionId, true);
@@ -159,6 +174,154 @@ export async function cancel(ownerId: number): Promise<Subscription> {
 
   logger.info({ ownerId, subscriptionId: sub.providerSubscriptionId }, "SUBSCRIPTION_CANCELLED");
   return updated;
+}
+
+/**
+ * Verifies a Google Play purchase token server-side (never trusts the
+ * client's own claim of success) and activates/updates the subscription row.
+ * Unlike Razorpay, there's no separate "create" step before purchase — the
+ * app buys directly through Play Billing, then hands us the resulting token.
+ */
+export async function verifyAndActivateGooglePlay(
+  ownerId: number,
+  params: { purchaseToken: string; productId: string },
+): Promise<Subscription> {
+  const [plan] = await db
+    .select()
+    .from(subscriptionPlansTable)
+    .where(eq(subscriptionPlansTable.googlePlayProductId, params.productId));
+  if (!plan) {
+    throw new SubscriptionServiceError(404, "PLAN_NOT_FOUND", "No plan matches this Google Play product.");
+  }
+
+  const state = await fetchSubscriptionState(params.purchaseToken);
+  if (state.status !== "ACTIVE" && state.status !== "GRACE_PERIOD") {
+    throw new SubscriptionServiceError(422, "SUBSCRIPTION_NOT_ACTIVE", `Google Play reports this subscription as "${state.status}".`);
+  }
+
+  try {
+    await acknowledgePurchase(params.purchaseToken, params.productId);
+  } catch (err) {
+    // Already-acknowledged purchases (e.g. a retry after a crash) throw here
+    // — not a reason to fail activation, just log and continue.
+    logger.info({ err, ownerId }, "Google Play acknowledge skipped (likely already acknowledged)");
+  }
+
+  const existing = await getCurrentSubscription(ownerId);
+  const isSameSubscription = existing?.providerSubscriptionId === params.purchaseToken;
+
+  const [row] = isSameSubscription
+    ? await db
+        .update(subscriptionsTable)
+        .set({
+          status: state.status,
+          planId: plan.id,
+          providerPlanId: state.productId,
+          expiryDate: state.expiryTime,
+          autoRenew: state.autoRenewing,
+          updatedAt: new Date(),
+        })
+        .where(eq(subscriptionsTable.id, existing.id))
+        .returning()
+    : await db
+        .insert(subscriptionsTable)
+        .values({
+          ownerId,
+          planId: plan.id,
+          platform: "ANDROID",
+          provider: "GOOGLE_PLAY",
+          providerPlanId: state.productId,
+          providerSubscriptionId: params.purchaseToken,
+          providerPaymentId: state.latestOrderId,
+          status: state.status,
+          expiryDate: state.expiryTime,
+          autoRenew: state.autoRenewing,
+        })
+        .returning();
+
+  if (state.latestOrderId) {
+    await db
+      .insert(paymentsTable)
+      .values({
+        ownerId,
+        subscriptionId: row.id,
+        provider: "GOOGLE_PLAY",
+        providerPaymentId: state.latestOrderId,
+        amount: plan.price,
+        currency: plan.currency,
+        paymentStatus: "succeeded",
+        paymentDate: new Date(),
+      })
+      .onConflictDoNothing();
+  }
+
+  await db.update(ownersTable).set({ freeMonthPending: false }).where(eq(ownersTable.id, ownerId));
+
+  logger.info({ ownerId, purchaseToken: params.purchaseToken, status: state.status }, "GOOGLE_PLAY_SUBSCRIPTION_ACTIVATED");
+  return row;
+}
+
+const GOOGLE_PLAY_EVENT_NAMES: Record<number, string> = {
+  1: "SUBSCRIPTION_RECOVERED",
+  2: "SUBSCRIPTION_RENEWED",
+  3: "SUBSCRIPTION_CANCELED",
+  4: "SUBSCRIPTION_PURCHASED",
+  5: "SUBSCRIPTION_ON_HOLD",
+  6: "SUBSCRIPTION_IN_GRACE_PERIOD",
+  7: "SUBSCRIPTION_RESTARTED",
+  9: "SUBSCRIPTION_DEFERRED",
+  12: "SUBSCRIPTION_REVOKED",
+  13: "SUBSCRIPTION_EXPIRED",
+};
+
+/**
+ * Handles a Real-time Developer Notification pushed via Cloud Pub/Sub.
+ * Same idempotency + re-fetch-don't-trust pattern as the Razorpay webhook:
+ * the notification only tells us *something* changed for a purchase token —
+ * the actual new state is always re-fetched from Google's API before the row
+ * is updated.
+ */
+export async function handleGooglePlayNotification(rawBody: string): Promise<void> {
+  const notification = decodePubSubMessage(rawBody);
+  const sub = notification?.subscriptionNotification;
+  if (!sub) {
+    logger.info("GOOGLE_PLAY_WEBHOOK_PROCESSED (no subscription notification, ignored)");
+    return;
+  }
+
+  const eventId = `${sub.purchaseToken}:${notification.eventTimeMillis}:${sub.notificationType}`;
+  const inserted = await db
+    .insert(webhookEventsTable)
+    .values({ provider: "GOOGLE_PLAY", providerEventId: eventId, eventType: GOOGLE_PLAY_EVENT_NAMES[sub.notificationType] ?? String(sub.notificationType) })
+    .onConflictDoNothing()
+    .returning();
+  if (inserted.length === 0) {
+    logger.info({ eventId }, "GOOGLE_PLAY_WEBHOOK_PROCESSED (duplicate, ignored)");
+    return;
+  }
+
+  const [row] = await db
+    .select()
+    .from(subscriptionsTable)
+    .where(eq(subscriptionsTable.providerSubscriptionId, sub.purchaseToken));
+  if (!row) {
+    logger.warn({ purchaseToken: sub.purchaseToken }, "Google Play webhook for unknown purchase token");
+    return;
+  }
+
+  const state = await fetchSubscriptionState(sub.purchaseToken);
+  await db
+    .update(subscriptionsTable)
+    .set({
+      status: state.status,
+      expiryDate: state.expiryTime,
+      autoRenew: state.autoRenewing,
+      cancelledAt: state.status === "CANCELLED" ? new Date() : row.cancelledAt,
+      updatedAt: new Date(),
+    })
+    .where(eq(subscriptionsTable.id, row.id));
+
+  logger.info({ ownerId: row.ownerId, purchaseToken: sub.purchaseToken, status: state.status }, "GOOGLE_PLAY_WEBHOOK_PROCESSED");
 }
 
 const STATUS_BY_EVENT: Record<string, string> = {

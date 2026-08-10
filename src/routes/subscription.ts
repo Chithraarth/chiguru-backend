@@ -14,8 +14,10 @@ import {
   listActivePlans,
   createRazorpaySubscription,
   verifyAndActivate,
+  verifyAndActivateGooglePlay,
   cancel,
   handleWebhookEvent,
+  handleGooglePlayNotification,
   SubscriptionServiceError,
 } from "../services/subscription.service";
 import { verifyWebhookSignature } from "../lib/razorpay";
@@ -33,6 +35,10 @@ function sendServiceError(res: Response, err: unknown) {
 }
 
 // GET /api/subscriptions/plans — public, DB-driven, no secrets.
+// googlePlayProductId IS included (unlike razorpayPlanId) because the
+// Android app needs it to call Play Billing's requestSubscription() itself —
+// there's no server-side "create" step for Play purchases the way there is
+// for Razorpay, so the client has to already know the product id up front.
 router.get("/subscriptions/plans", async (_req, res) => {
   const plans = await listActivePlans();
   res.json({
@@ -44,6 +50,7 @@ router.get("/subscriptions/plans", async (_req, res) => {
       currency: p.currency,
       billingPeriod: p.billingPeriod,
       managerLimit: p.managerLimit,
+      googlePlayProductId: p.googlePlayProductId,
     })),
   });
 });
@@ -114,6 +121,24 @@ router.post("/subscriptions/razorpay/verify", requireOwner, async (req, res) => 
       subscriptionId: razorpay_subscription_id,
       signature: razorpay_signature,
     });
+    res.json({ status: sub.status });
+  } catch (err) {
+    sendServiceError(res, err);
+  }
+});
+
+// POST /api/subscriptions/android/verify — body {purchaseToken, productId}.
+// Mirrors /subscriptions/razorpay/verify's "never trust the client" shape:
+// the token is re-checked against Google's own API before anything is
+// written, same as Razorpay's signature+fetch re-check above.
+router.post("/subscriptions/android/verify", requireOwner, async (req, res) => {
+  const { purchaseToken, productId } = req.body as { purchaseToken?: string; productId?: string };
+  if (!purchaseToken || !productId) {
+    res.status(400).json({ message: "purchaseToken and productId are required", code: "INVALID_REQUEST" });
+    return;
+  }
+  try {
+    const sub = await verifyAndActivateGooglePlay(req.owner!.id, { purchaseToken, productId });
     res.json({ status: sub.status });
   } catch (err) {
     sendServiceError(res, err);
@@ -209,6 +234,30 @@ export async function razorpayWebhookHandler(req: Request, res: Response) {
   } catch (err) {
     logger.error({ err }, "Failed processing Razorpay webhook");
     // Still 200 — Razorpay would otherwise retry indefinitely on a bug that
+    // needs a server-side fix, not something a retry can resolve.
+  }
+
+  res.json({ received: true });
+}
+
+// ── Google Play RTDN webhook ─────────────────────────────────────────────────
+// Cloud Pub/Sub push subscriptions have no signature header like Razorpay's —
+// the standard way to secure one is a secret token in the endpoint URL itself
+// (set this same value as the push subscription's URL query string in Google
+// Cloud Console, e.g. .../webhooks/google-play?token=...). Mounted with
+// express.json() like any normal route (no raw-body signature check needed).
+export async function googlePlayWebhookHandler(req: Request, res: Response) {
+  if (!process.env.GOOGLE_PLAY_WEBHOOK_TOKEN || req.query.token !== process.env.GOOGLE_PLAY_WEBHOOK_TOKEN) {
+    logger.warn("Google Play webhook token verification failed");
+    res.status(400).send("Invalid token");
+    return;
+  }
+
+  try {
+    await handleGooglePlayNotification(JSON.stringify(req.body));
+  } catch (err) {
+    logger.error({ err }, "Failed processing Google Play webhook");
+    // Still 200 — Pub/Sub would otherwise retry indefinitely on a bug that
     // needs a server-side fix, not something a retry can resolve.
   }
 
