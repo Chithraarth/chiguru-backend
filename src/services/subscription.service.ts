@@ -12,7 +12,7 @@ import {
 } from "../db";
 import { razorpay, ensureRazorpayPlanId, totalCountForPeriod, verifyCheckoutSignature } from "../lib/razorpay";
 import { fetchSubscriptionState, acknowledgePurchase, decodePubSubMessage } from "../lib/google-play";
-import { getCurrentSubscription, isSubStatusActiveLike } from "./entitlement.service";
+import { getCurrentSubscription, isSubStatusActiveLike, getManagersUsed } from "./entitlement.service";
 import { logger } from "../lib/logger";
 
 export class SubscriptionServiceError extends Error {
@@ -51,20 +51,27 @@ export async function createRazorpaySubscription(
   }
 
   const plan = await getPlanOrThrow(planId);
-  const razorpayPlanId = await ensureRazorpayPlanId(plan);
 
-  const [owner] = await db.select().from(ownersTable).where(eq(ownersTable.id, ownerId));
-  // Share-to-earn reward earned before subscribing: delay the first charge by
-  // 30 days instead of charging immediately.
-  const startAt = owner?.freeMonthPending
-    ? Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60
-    : undefined;
+  // Block a switch to a plan smaller than the manager seats already in use —
+  // the owner would otherwise be left over the new plan's limit with no
+  // guidance on which managers to remove. Checked here (before Razorpay is
+  // even involved) rather than at activation time, so the owner sees this
+  // before paying, not after.
+  const managersUsed = await getManagersUsed(ownerId);
+  if (managersUsed > plan.managerLimit) {
+    throw new SubscriptionServiceError(
+      409,
+      "PLAN_TOO_SMALL",
+      `You have ${managersUsed} managers, but this plan only allows ${plan.managerLimit}. Remove some managers first or choose a larger plan.`,
+    );
+  }
+
+  const razorpayPlanId = await ensureRazorpayPlanId(plan);
 
   const razorpaySub = await razorpay.subscriptions.create({
     plan_id: razorpayPlanId,
     customer_notify: 1,
     total_count: totalCountForPeriod(plan.billingPeriod),
-    start_at: startAt,
     notes: { ownerId: String(ownerId), planId: String(plan.id) },
   });
 
@@ -136,8 +143,6 @@ export async function verifyAndActivate(
       paymentDate: new Date(),
     })
     .onConflictDoNothing();
-
-  await db.update(ownersTable).set({ freeMonthPending: false }).where(eq(ownersTable.id, ownerId));
 
   logger.info({ ownerId, subscriptionId: params.subscriptionId }, "SUBSCRIPTION_ACTIVATED");
   return updated;
@@ -254,8 +259,6 @@ export async function verifyAndActivateGooglePlay(
       })
       .onConflictDoNothing();
   }
-
-  await db.update(ownersTable).set({ freeMonthPending: false }).where(eq(ownersTable.id, ownerId));
 
   logger.info({ ownerId, purchaseToken: params.purchaseToken, status: state.status }, "GOOGLE_PLAY_SUBSCRIPTION_ACTIVATED");
   return row;

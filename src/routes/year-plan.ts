@@ -1,11 +1,22 @@
+import type { NextFunction, Request, Response } from "express";
 import { Router } from "express";
 import { db } from "../db";
 import { planTasksTable, farmProfileTable, cropsTable } from "../db/schema";
 import { eq, and, asc } from "drizzle-orm";
 import { openai } from "../integrations-openai-ai-server";
 import { requireActiveSubscription } from "../middlewares/subscriptionGate";
+import { effectiveOwnerId } from "../middlewares/firebaseAuth";
+import { ensureAICredit, chargeAISafe } from "../lib/wallet";
 
 const router = Router();
+
+/** Wallet pre-check for a given AI feature — blocks with 402 if the wallet can't cover it. */
+function requireWalletCredit(feature: string) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const ownerId = effectiveOwnerId(req)!; // requireActiveSubscription already ran and guarantees this
+    if (await ensureAICredit(ownerId, res, feature)) next();
+  };
+}
 
 // Same estate-scoping convention as farm.ts: an authenticated request's estate
 // header must belong to that Owner; unauthenticated/legacy calls fall back to
@@ -155,7 +166,7 @@ router.delete("/plan-tasks/:id", async (req, res) => {
 });
 
 // AI generation: build the next 12 months of tasks from the farm profile + crops.
-router.post("/plan-tasks/generate", requireActiveSubscription, async (req, res) => {
+router.post("/plan-tasks/generate", requireActiveSubscription, requireWalletCredit("year_plan"), async (req, res) => {
   const eid = await activeEstateId(req);
   if (eid == null) { res.status(400).json({ message: "Set up your farm first" }); return; }
 
@@ -233,6 +244,7 @@ Respond ONLY with JSON: {"tasks":[{"cropId":1,"month":"2026-08","day":10,"title"
       ));
       return tx.insert(planTasksTable).values(tasks).returning();
     });
+    await chargeAISafe(effectiveOwnerId(req)!, "year_plan");
     res.status(201).json(inserted);
   } catch (err) {
     console.error("year plan generation failed:", err);

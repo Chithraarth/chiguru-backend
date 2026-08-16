@@ -2,7 +2,6 @@ import {
   pgTable,
   serial,
   text,
-  boolean,
   timestamp,
 } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
@@ -28,14 +27,6 @@ export const ownersTable = pgTable("owners", {
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
   lastLogin: timestamp("last_login").notNull().defaultNow(),
-  // ── Share-to-earn referral (share on 3 different apps → 1 month free) ──────
-  // Comma-separated platform ids the owner has shared to (whatsapp,facebook,x,telegram,other).
-  sharePlatforms: text("share_platforms"),
-  shareRewardClaimedAt: timestamp("share_reward_claimed_at"),
-  // Set true the moment the reward is earned while NOT yet subscribed — the
-  // next Razorpay subscription is created with its billing start delayed 30
-  // days instead of charging immediately, then cleared once that completes.
-  freeMonthPending: boolean("free_month_pending").notNull().default(false),
 });
 
 export const insertOwnerSchema = createInsertSchema(ownersTable).omit({

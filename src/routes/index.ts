@@ -14,6 +14,7 @@ import ownersRouter from "./owners";
 import subscriptionRouter from "./subscription";
 import yearPlanRouter from "./year-plan";
 import pushRouter from "./push";
+import walletRouter from "./wallet";
 
 const router: IRouter = Router();
 
@@ -32,5 +33,6 @@ router.use(managersRouter);
 router.use(errorsRouter);
 router.use(ownersRouter);
 router.use(subscriptionRouter);
+router.use(walletRouter);
 
 export default router;

@@ -2,7 +2,6 @@ import { Router, type IRouter, type Request, type Response } from "express";
 import { eq, desc } from "drizzle-orm";
 import { db, paymentsTable, subscriptionPlansTable, ownersTable } from "../db";
 import { requireOwner } from "../middlewares/firebaseAuth";
-import { isSubStatusActiveLike } from "../services/entitlement.service";
 import {
   getCurrentSubscription,
   getPlan,
@@ -80,9 +79,6 @@ router.get("/subscriptions/me", requireOwner, async (req, res) => {
         }
       : null,
     entitlement: { managerLimit, managersUsed, remainingManagers },
-    sharePlatforms: req.owner!.sharePlatforms,
-    shareRewardClaimedAt: req.owner!.shareRewardClaimedAt,
-    freeMonthPending: req.owner!.freeMonthPending,
   });
 });
 
@@ -143,48 +139,6 @@ router.post("/subscriptions/android/verify", requireOwner, async (req, res) => {
   } catch (err) {
     sendServiceError(res, err);
   }
-});
-
-const SHARE_PLATFORMS = ["whatsapp", "facebook", "x", "telegram", "other"];
-const SHARE_TARGET = 3;
-
-// Not part of the core spec, but a previously-requested feature kept from
-// the earlier Stripe-based design. Razorpay has no direct "credit customer
-// balance" API for an already-active subscriber, so this phase only
-// mechanically grants the reward for an owner who isn't subscribed yet
-// (their next /razorpay/create gets a 30-day delayed start) — an already-
-// active subscriber's claim is still recorded, but the free month is not
-// automatically applied to their running subscription. See Known Limitations.
-router.post("/subscriptions/share", requireOwner, async (req, res) => {
-  const { platform } = req.body as { platform?: string };
-  if (!platform || !SHARE_PLATFORMS.includes(platform)) {
-    res.status(400).json({ message: "Unknown share platform", code: "INVALID_PLATFORM" });
-    return;
-  }
-
-  const owner = req.owner!;
-  const shared = new Set((owner.sharePlatforms ?? "").split(",").filter(Boolean));
-  shared.add(platform);
-  const sharePlatforms = Array.from(shared).join(",");
-
-  let rewardGranted = false;
-  const updates: Partial<typeof owner> = { sharePlatforms };
-  if (!owner.shareRewardClaimedAt && shared.size >= SHARE_TARGET) {
-    const sub = await getCurrentSubscription(owner.id);
-    if (!sub || !isSubStatusActiveLike(sub.status)) {
-      updates.freeMonthPending = true;
-    }
-    updates.shareRewardClaimedAt = new Date();
-    rewardGranted = true;
-  }
-
-  const [updated] = await db.update(ownersTable).set(updates).where(eq(ownersTable.id, owner.id)).returning();
-  res.json({
-    sharePlatforms: updated.sharePlatforms,
-    shareRewardClaimedAt: updated.shareRewardClaimedAt,
-    freeMonthPending: updated.freeMonthPending,
-    rewardGranted,
-  });
 });
 
 router.post("/subscriptions/cancel", requireOwner, async (req, res) => {

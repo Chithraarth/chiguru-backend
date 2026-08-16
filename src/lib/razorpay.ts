@@ -64,6 +64,25 @@ export function verifyCheckoutSignature(paymentId: string, subscriptionId: strin
   );
 }
 
+/** One-time order (e.g. a wallet recharge) — creates the Razorpay order the client's checkout.js opens. */
+export async function createRechargeOrder(amountRupees: number, ownerId: number): Promise<{ orderId: string; amount: number; currency: string }> {
+  const order = await razorpay.orders.create({
+    amount: Math.round(amountRupees * 100),
+    currency: "INR",
+    notes: { ownerId: String(ownerId), purpose: "wallet_recharge" },
+  });
+  return { orderId: order.id, amount: amountRupees, currency: order.currency };
+}
+
+/** Verifies the {razorpay_order_id, razorpay_payment_id, razorpay_signature} the frontend sends back after a one-time order (e.g. wallet recharge) completes. Payload order differs from the subscription case — order_id + "|" + payment_id. */
+export function verifyOrderPaymentSignature(orderId: string, paymentId: string, signature: string): boolean {
+  return validatePaymentVerification(
+    { order_id: orderId, payment_id: paymentId },
+    signature,
+    process.env.RAZORPAY_KEY_SECRET!,
+  );
+}
+
 /** Verifies the X-Razorpay-Signature header on an incoming webhook against the raw request body. Uses the separate webhook secret — NOT the key secret. */
 export function verifyWebhookSignature(rawBody: string, signature: string): boolean {
   if (!process.env.RAZORPAY_WEBHOOK_SECRET) return false;

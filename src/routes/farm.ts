@@ -870,6 +870,108 @@ router.get("/workers/:id/wages", async (req, res) => {
   });
 });
 
+// All-time money summary for one worker: days worked, wages + overtime earned,
+// loans taken/repaid/outstanding, and direct payments received — one clear
+// balance per person for settling individually (unlike /wages above, which is
+// scoped to a single month).
+router.get("/workers/:id/money", async (req, res) => {
+  const workerId = Number(req.params.id);
+  if (!Number.isInteger(workerId)) return res.status(400).json({ message: "Invalid worker id" });
+
+  const eid = await activeEstateId(req);
+  const workers = await db
+    .select()
+    .from(workersTable)
+    .where(estateScoped(workersTable.id, workersTable.estateId, workerId, eid));
+  if (workers.length === 0) return res.status(404).json({ message: "Not found" });
+
+  // Attendance (scoped to the active estate via the parent work group, since
+  // attendance rows have no estate_id of their own).
+  const attConditions = [eq(attendanceTable.workerId, workerId)];
+  if (eid != null) {
+    attConditions.push(inArray(attendanceTable.workGroupId, estateGroupIds(eid)));
+  }
+  const attRows = await db
+    .select()
+    .from(attendanceTable)
+    .where(and(...attConditions));
+
+  const totalDays = attRows.length;
+  const totalWage = attRows.reduce((s, r) => s + Number(r.wageAmount ?? 0), 0);
+  const totalOvertimeHours = attRows.reduce((s, r) => s + Number(r.overtimeHours ?? 0), 0);
+  const totalOvertimeAmount = attRows.reduce(
+    (s, r) => s + Number(r.overtimeHours ?? 0) * Number(r.overtimeRate ?? 0),
+    0,
+  );
+  const lastWorkedDate = attRows.map((r) => r.date).sort().pop() ?? null;
+
+  // Loans: taken, repaid, outstanding.
+  const loanRows = await db
+    .select()
+    .from(loansTable)
+    .where(and(eq(loansTable.workerId, workerId), eid != null ? eq(loansTable.estateId, eid) : undefined));
+  const loanTaken = loanRows.reduce((s, r) => s + Number(r.amount), 0);
+  const loanRepaid = loanRows.reduce((s, r) => s + Number(r.repaidAmount), 0);
+  const loanOutstanding = loanRows.reduce(
+    (s, r) => s + Math.max(0, Number(r.totalDue) - Number(r.repaidAmount)),
+    0,
+  );
+
+  // Direct payments recorded against this worker.
+  const paymentRows = await db
+    .select()
+    .from(workerPaymentsTable)
+    .where(and(
+      eq(workerPaymentsTable.workerId, workerId),
+      eid != null ? eq(workerPaymentsTable.estateId, eid) : undefined,
+    ))
+    .orderBy(desc(workerPaymentsTable.paymentDate));
+  const paymentsTotal = paymentRows.reduce((s, r) => s + Number(r.amount), 0);
+
+  // Overtime pay and harvest-picking bonuses are already baked into wageAmount
+  // by the client, so summing wageAmount IS the full earned amount.
+  // (overtimeHours/overtimeRate/harvestedKg are kept for display + settlement
+  // tracking — adding them again here would double-count.)
+  const totalHarvestedKg = attRows.reduce((s, r) => s + Number(r.harvestedKg ?? 0), 0);
+  const totalEarned = totalWage;
+  const netDue = totalEarned - loanOutstanding - paymentsTotal;
+
+  return res.json({
+    workerId,
+    workerName: workers[0].name,
+    upiId: workers[0].upiId ?? null,
+    totalDays,
+    totalWage,
+    totalOvertimeHours,
+    totalOvertimeAmount,
+    totalHarvestedKg,
+    totalEarned,
+    lastWorkedDate,
+    loanTaken,
+    loanRepaid,
+    loanOutstanding,
+    paymentsTotal,
+    paymentsCount: paymentRows.length,
+    netDue,
+    payments: paymentRows.map((p) => ({
+      id: p.id,
+      amount: p.amount,
+      method: p.method,
+      methodLabel: p.methodLabel,
+      paymentDate: p.paymentDate,
+      note: p.note,
+    })),
+    loans: loanRows.map((l) => ({
+      id: l.id,
+      amount: l.amount,
+      totalDue: l.totalDue,
+      repaidAmount: l.repaidAmount,
+      status: l.status,
+      issuedDate: l.issuedDate,
+    })),
+  });
+});
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Work Groups
 // ──────────────────────────────────────────────────────────────────────────────
@@ -896,6 +998,8 @@ router.get("/work-groups", async (req, res) => {
       loanNotes: workGroupsTable.loanNotes,
       upiId: workGroupsTable.upiId,
       isActive: workGroupsTable.isActive,
+      seasonClosed: workGroupsTable.seasonClosed,
+      clearedAt: workGroupsTable.clearedAt,
       createdAt: workGroupsTable.createdAt,
     })
     .from(workGroupsTable)
@@ -966,6 +1070,31 @@ router.patch("/work-groups/:id", async (req, res) => {
     .returning();
   if (!row) return res.status(404).json({ message: "Not found" });
   return res.json(row);
+});
+
+// Archive a fully-settled work group into accounts history. Idempotent: a
+// second press keeps the original cleared date. Records stay intact — the
+// group only disappears from the active work-group lists.
+router.post("/work-groups/:id/clear", async (req, res) => {
+  const eid = await activeEstateId(req);
+  const groupId = Number(req.params.id);
+  const [group] = await db
+    .select()
+    .from(workGroupsTable)
+    .where(estateScoped(workGroupsTable.id, workGroupsTable.estateId, groupId, eid));
+  if (!group || group.deletedAt != null) return res.status(404).json({ message: "Not found" });
+  // Conditional update — concurrent/replayed clears never overwrite the
+  // original cleared date (offline replays hit this route more than once).
+  const [row] = await db
+    .update(workGroupsTable)
+    .set({ clearedAt: new Date(), seasonClosed: true })
+    .where(and(eq(workGroupsTable.id, groupId), isNull(workGroupsTable.clearedAt)))
+    .returning();
+  if (!row) {
+    const [again] = await db.select().from(workGroupsTable).where(eq(workGroupsTable.id, groupId));
+    return res.json({ clearedAt: again?.clearedAt ?? null });
+  }
+  return res.json({ clearedAt: row.clearedAt });
 });
 
 // Permanently delete a work group and every row that references it. Used by
@@ -1191,9 +1320,12 @@ router.post("/work-groups/:id/advance-payments", async (req, res) => {
   if (!(await groupInEstate(groupId, eid))) {
     return res.status(404).json({ message: "Not found" });
   }
-  const { periodLabel, daysCount, workerCount, advancePerWorkerPerDay, paymentDate, notes } = req.body;
+  const { periodLabel, daysCount, workerCount, advancePerWorkerPerDay, paymentDate, notes, method, clientId } = req.body;
+  if (method != null && !["cash", "account"].includes(method)) {
+    return res.status(400).json({ message: "method must be 'cash' or 'account'" });
+  }
   const totalAdvancePaid = Number(daysCount) * Number(workerCount) * Number(advancePerWorkerPerDay);
-  const [row] = await db.insert(groupAdvancePaymentsTable).values({
+  const values = {
     workGroupId: groupId,
     paymentDate: paymentDate ?? new Date().toISOString().slice(0, 10),
     periodLabel,
@@ -1201,8 +1333,30 @@ router.post("/work-groups/:id/advance-payments", async (req, res) => {
     workerCount: Number(workerCount),
     advancePerWorkerPerDay: String(advancePerWorkerPerDay),
     totalAdvancePaid: String(totalAdvancePaid),
+    method: method ?? "cash",
     notes: notes || null,
-  }).returning();
+    clientId: typeof clientId === "string" && clientId.trim() !== "" ? clientId : null,
+  };
+
+  // Idempotent replay: a flaky network can drop the response after the row was
+  // committed; the offline queue then re-sends the same clientId. Never insert
+  // a duplicate money record — return the row already stored.
+  if (values.clientId) {
+    const [inserted] = await db.insert(groupAdvancePaymentsTable).values(values)
+      .onConflictDoNothing({ target: groupAdvancePaymentsTable.clientId })
+      .returning();
+    if (inserted) return res.status(201).json(inserted);
+    const [existing] = await db.select().from(groupAdvancePaymentsTable)
+      .where(and(
+        eq(groupAdvancePaymentsTable.clientId, values.clientId),
+        eq(groupAdvancePaymentsTable.workGroupId, groupId),
+      ))
+      .limit(1);
+    if (!existing) return res.status(404).json({ message: "Not found" });
+    return res.status(200).json(existing);
+  }
+
+  const [row] = await db.insert(groupAdvancePaymentsTable).values(values).returning();
   return res.status(201).json(row);
 });
 

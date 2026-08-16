@@ -138,6 +138,11 @@ export const workGroupsTable = pgTable("work_groups", {
   notes: text("notes"),
   seasonClosed: boolean("season_closed").notNull().default(false),
   seasonSummary: text("season_summary"),
+  // Set once a fully-settled group is archived via POST /work-groups/:id/clear.
+  // Non-null means the group has been swept into accounts history; the clear
+  // route is keyed on this being null so a retried/double-tapped clear can
+  // never re-run (idempotent).
+  clearedAt: timestamp("cleared_at"),
   // Payee handle of the group contractor/maistry for direct payments.
   upiId: text("upi_id"),
   // How often pending overtime / picking bonus gets manually settled - purely
@@ -188,6 +193,8 @@ export const groupAdvancePaymentsTable = pgTable("group_advance_payments", {
   workerCount: integer("worker_count").notNull(),
   advancePerWorkerPerDay: numeric("advance_per_worker_per_day", { precision: 10, scale: 2 }).notNull(),
   totalAdvancePaid: numeric("total_advance_paid", { precision: 10, scale: 2 }).notNull(),
+  // How the advance was actually paid out: "cash" | "account" (bank/UPI transfer).
+  method: text("method").notNull().default("cash"),
   notes: text("notes"),
   // Idempotency key for the overtime/harvest-bonus "settle" actions, which
   // write a ledger row here - a retried settle must not double-record the payout.
@@ -425,6 +432,7 @@ export const agronomistPayoutsTable = pgTable("agronomist_payouts", {
 
 export const consultationsTable = pgTable("consultations", {
   id: serial("id").primaryKey(),
+  ownerId: integer("owner_id").notNull().references(() => ownersTable.id),
   agronomistId: integer("agronomist_id").notNull().references(() => agronomistsTable.id),
   mode: text("mode").notNull().default("chat"),
   status: text("status").notNull().default("active"),
@@ -443,11 +451,21 @@ export const consultationMessagesTable = pgTable("consultation_messages", {
   consultationId: integer("consultation_id").notNull().references(() => consultationsTable.id),
   sender: text("sender").notNull(),
   text: text("text").notNull(),
+  // Optional photo/voice-note attachment: "image" or "audio". mediaUrl holds a
+  // compressed base64 data URL (same storage pattern as photoUrl elsewhere,
+  // e.g. diseaseDiagnosesTable.photoUrl).
+  mediaType: text("media_type"),
+  mediaUrl: text("media_url"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
+// One row per Owner. Originally a Replit-era single global row (no ownerId) —
+// migrated to per-owner scoping since this table backs real per-owner state
+// (agri-doctor consultation wallet, manager-device/estate add-ons). Do NOT
+// query this table without filtering by ownerId.
 export const appSettingsTable = pgTable("app_settings", {
   id: serial("id").primaryKey(),
+  ownerId: integer("owner_id").notNull().references(() => ownersTable.id).unique(),
   trialStartDate: timestamp("trial_start_date").notNull().defaultNow(),
   walletBalance: numeric("wallet_balance", { precision: 10, scale: 2 }).notNull().default("0"),
   // Running total of the 20% platform fee kept by the website owner/developer.
@@ -464,9 +482,14 @@ export const appSettingsTable = pgTable("app_settings", {
   // Manager device is a standalone paid add-on (not bundled in any plan).
   managerDeviceAddonAt: timestamp("manager_device_addon_at"),
   managerDeviceAddonExpiresAt: timestamp("manager_device_addon_expires_at"),
+  // Idempotency: an offline-queued purchase replayed after a lost response
+  // must not extend the add-on a second time for the same purchase.
+  deviceAddonLastKey: text("device_addon_last_key"),
   // "Zamindar" estate add-on: each purchase (₹799) permanently unlocks one more
   // estate in the switcher. Base allowance is 1 free estate; max = 1 + this count.
   extraEstates: integer("extra_estates").notNull().default(0),
+  // Idempotency: a replayed offline purchase must not unlock a second estate.
+  estateAddonLastKey: text("estate_addon_last_key"),
   cameraAccessoryRequested: boolean("camera_accessory_requested").notNull().default(false),
   cameraAccessoryRequestedAt: timestamp("camera_accessory_requested_at"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
@@ -801,6 +824,12 @@ export const pushDevicesTable = pgTable("push_devices", {
   // Opt-in to the extra mid-month (days 15-19) nudge, on top of the
   // always-on month-start (days 1-5) reminder.
   midmonthEnabled: boolean("midmonth_enabled").notNull().default(true),
+  // ISO 639-1 language code (en/hi/kn/ta/te/ml/mr) for notification text.
+  // null means "use English".
+  lang: text("lang"),
+  // IANA timezone name used to compute the device's local send-window hour.
+  // null means "use Asia/Kolkata".
+  timezone: text("timezone"),
   lastNotifiedMonth: text("last_notified_month"), // "YYYY-MM"
   lastMidmonthNotifiedMonth: text("last_midmonth_notified_month"),
   lastSentAt: timestamp("last_sent_at"),

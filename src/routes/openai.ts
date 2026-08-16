@@ -1,3 +1,4 @@
+import type { NextFunction, Request, Response } from "express";
 import { Router } from "express";
 import { db } from "../db";
 import { conversations, messages, farmProfileTable, cropsTable, expensesTable, spraysTable, harvestsTable, diseaseDiagnosesTable } from "../db";
@@ -5,8 +6,18 @@ import { eq, asc, gte } from "drizzle-orm";
 import { openai } from "../integrations-openai-ai-server";
 import { CROP_DISEASE_KNOWLEDGE } from "../lib/crop-diseases";
 import { requireActiveSubscription } from "../middlewares/subscriptionGate";
+import { effectiveOwnerId } from "../middlewares/firebaseAuth";
+import { ensureAICredit, chargeAISafe } from "../lib/wallet";
 
 const router = Router();
+
+/** Wallet pre-check for a given AI feature — blocks with 402 if the wallet can't cover it. */
+function requireWalletCredit(feature: string) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const ownerId = effectiveOwnerId(req)!; // requireActiveSubscription already ran and guarantees this
+    if (await ensureAICredit(ownerId, res, feature)) next();
+  };
+}
 
 // ──────────────────────────────────────────────
 // Conversations CRUD
@@ -47,7 +58,7 @@ router.get("/openai/conversations/:id/messages", async (req, res) => {
 // ──────────────────────────────────────────────
 // Chat with full farm context (SSE streaming)
 // ──────────────────────────────────────────────
-router.post("/openai/conversations/:id/messages", async (req, res) => {
+router.post<{ id: string }>("/openai/conversations/:id/messages", requireActiveSubscription, requireWalletCredit("ai_chat"), async (req, res) => {
   const id = parseInt(req.params.id);
   const { content } = req.body as { content: string };
 
@@ -132,6 +143,7 @@ Guidelines:
     }
 
     await db.insert(messages).values({ conversationId: id, role: "assistant", content: fullResponse });
+    await chargeAISafe(effectiveOwnerId(req)!, "ai_chat");
     res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
   } catch {
     res.write(`data: ${JSON.stringify({ error: "AI service error" })}\n\n`);
@@ -142,7 +154,7 @@ Guidelines:
 // ──────────────────────────────────────────────
 // Stateless AI Chat (single-shot, full farm context)
 // ──────────────────────────────────────────────
-router.post("/ai/chat", requireActiveSubscription, async (req, res) => {
+router.post("/ai/chat", requireActiveSubscription, requireWalletCredit("ai_chat"), async (req, res) => {
   const { message, cropType } = req.body as { message: string; cropType?: string };
 
   if (!message) { res.status(400).json({ error: "message is required" }); return; }
@@ -206,6 +218,7 @@ Guidelines:
     });
 
     const response = completion.choices[0]?.message?.content ?? "I could not process your question. Please try again.";
+    await chargeAISafe(effectiveOwnerId(req)!, "ai_chat");
     res.json({ response, farmContextAvailable: !!profile });
   } catch (err) {
     console.error("AI chat error:", err);
@@ -216,7 +229,7 @@ Guidelines:
 // ──────────────────────────────────────────────
 // Disease Detection (vision analysis)
 // ──────────────────────────────────────────────
-router.post("/ai/disease", requireActiveSubscription, async (req, res) => {
+router.post("/ai/disease", requireActiveSubscription, requireWalletCredit("disease_check"), async (req, res) => {
   const { imageBase64, cropType } = req.body as { imageBase64: string; cropType?: string };
 
   if (!imageBase64) { res.status(400).json({ error: "imageBase64 is required" }); return; }
@@ -345,6 +358,7 @@ ${CROP_DISEASE_KNOWLEDGE}`;
       console.error("Failed to log diagnosis (non-fatal):", logErr);
     }
 
+    await chargeAISafe(effectiveOwnerId(req)!, "disease_check");
     res.json({ ...parsed, id: diagnosisId });
   } catch (err) {
     console.error("Disease detection error:", err);
@@ -376,7 +390,7 @@ router.patch("/ai/disease/:id/outcome", async (req, res) => {
 // ──────────────────────────────────────────────
 // Worker Headcount (vision — crowd counting)
 // ──────────────────────────────────────────────
-router.post("/ai/count-workers", async (req, res) => {
+router.post("/ai/count-workers", requireActiveSubscription, requireWalletCredit("count_workers"), async (req, res) => {
   const { imageBase64 } = req.body as { imageBase64: string };
   if (!imageBase64) { res.status(400).json({ error: "imageBase64 is required" }); return; }
 
@@ -419,6 +433,7 @@ If the image is too blurry or unclear, return count: 0 and confidence: "low".`,
       parsed = { count: 0, confidence: "low", notes: "Could not parse AI response. Please try again." };
     }
 
+    await chargeAISafe(effectiveOwnerId(req)!, "count_workers");
     res.json({ count: Math.max(0, Math.round(Number(parsed.count) || 0)), confidence: parsed.confidence ?? "low", notes: parsed.notes ?? "" });
   } catch (err) {
     console.error("Worker count error:", err);
@@ -429,7 +444,7 @@ If the image is too blurry or unclear, return count: 0 and confidence: "low".`,
 // ──────────────────────────────────────────────
 // Old Account Book Scan (vision — reads handwritten/printed farm ledgers)
 // ──────────────────────────────────────────────
-router.post("/ai/accounts-scan", requireActiveSubscription, async (req, res) => {
+router.post("/ai/accounts-scan", requireActiveSubscription, requireWalletCredit("accounts_scan"), async (req, res) => {
   const { imageBase64 } = req.body as { imageBase64: string };
   if (!imageBase64) { res.status(400).json({ error: "imageBase64 is required" }); return; }
 
@@ -493,13 +508,20 @@ Be thorough — read every line. NEVER silently guess when something is unclear.
 
     const raw = response.choices[0]?.message?.content ?? "{}";
     let parsed: Record<string, unknown>;
+    let parseFailed = false;
     try {
       const jsonMatch = raw.match(/\{[\s\S]*\}/);
       parsed = JSON.parse(jsonMatch?.[0] ?? raw);
     } catch {
       parsed = { error: "Could not read entries. Please take a clearer photo in good light and try again." };
+      parseFailed = true;
     }
 
+    // Only charge for a scan that actually produced a usable result — not the
+    // "couldn't read the photo" fallback, and not the model's own reported error.
+    if (!parseFailed && !parsed.error) {
+      await chargeAISafe(effectiveOwnerId(req)!, "accounts_scan");
+    }
     res.json(parsed);
   } catch (err) {
     console.error("Accounts scan error:", err);

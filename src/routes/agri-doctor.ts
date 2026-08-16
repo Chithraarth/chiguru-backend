@@ -28,7 +28,7 @@ import {
   canUseAgriDoctor,
   canUseManagerDevices,
 } from "../lib/subscription";
-import { requireOwner } from "../middlewares/firebaseAuth";
+import { requireOwner, effectiveOwnerId } from "../middlewares/firebaseAuth";
 import { requireActiveSubscription } from "../middlewares/subscriptionGate";
 
 const router = Router();
@@ -211,10 +211,10 @@ async function ensureSeed() {
   }
 }
 
-async function getSettings() {
-  const rows = await db.select().from(appSettingsTable).limit(1);
+async function getSettings(ownerId: number) {
+  const rows = await db.select().from(appSettingsTable).where(eq(appSettingsTable.ownerId, ownerId)).limit(1);
   if (rows.length > 0) return rows[0];
-  const [row] = await db.insert(appSettingsTable).values({}).returning();
+  const [row] = await db.insert(appSettingsTable).values({ ownerId }).returning();
   return row;
 }
 
@@ -428,8 +428,9 @@ router.post("/agronomists/:id/payouts/:payoutId/paid", async (req, res) => {
 // App settings, wallet & subscription
 // ──────────────────────────────────────────────────────────────────────────────
 
-router.get("/app-settings", async (_req, res) => {
-  const settings = await getSettings();
+router.get("/app-settings", requireOwner, async (req, res) => {
+  const ownerId = effectiveOwnerId(req)!;
+  const settings = await getSettings(ownerId);
   const now = new Date();
   const trialStart = new Date(settings.trialStartDate as unknown as string);
   const { trialEnd, sellerTrialEnd, trialActive, sellerTrialActive, trialDaysLeft, sellerTrialDaysLeft } =
@@ -444,7 +445,8 @@ router.get("/app-settings", async (_req, res) => {
   // Estate allowance: base 1 free estate + one per purchased "Zamindar" add-on.
   const [estateCountRow] = await db
     .select({ count: sql<number>`count(*)::int` })
-    .from(farmProfileTable);
+    .from(farmProfileTable)
+    .where(eq(farmProfileTable.ownerId, ownerId));
   const estateCount = estateCountRow?.count ?? 0;
   const extraEstates = settings.extraEstates ?? 0;
   const maxEstates = BASE_ESTATE_ALLOWANCE + extraEstates;
@@ -467,9 +469,9 @@ router.get("/app-settings", async (_req, res) => {
     activePlan,
     subscriptionActive,
     isSubscribed,
-    canSell: await canSell(),
-    canUseAgriDoctor: await canUseAgriDoctor(),
-    canUseManagerDevices: await canUseManagerDevices(),
+    canSell: await canSell(ownerId),
+    canUseAgriDoctor: await canUseAgriDoctor(ownerId),
+    canUseManagerDevices: await canUseManagerDevices(ownerId),
     managerDeviceAddonActive: isManagerDeviceAddonActive(settings, now),
     extraEstates,
     estateCount,
@@ -478,11 +480,12 @@ router.get("/app-settings", async (_req, res) => {
   });
 });
 
-router.post("/app-settings/wallet/topup", async (req, res) => {
+router.post("/app-settings/wallet/topup", requireOwner, async (req, res) => {
+  const ownerId = effectiveOwnerId(req)!;
   const { amount } = req.body as { amount?: number };
   const amt = Number(amount);
   if (!amt || amt <= 0) return res.status(400).json({ error: "amount must be greater than 0" });
-  const settings = await getSettings();
+  const settings = await getSettings(ownerId);
   const newBalance = (Number(settings.walletBalance) || 0) + amt;
   const [row] = await db
     .update(appSettingsTable)
@@ -493,13 +496,14 @@ router.post("/app-settings/wallet/topup", async (req, res) => {
 });
 
 // Premium planters (Gold/Platinum, or in-trial) can register interest in the
-// Bluetooth mini camera accessory. Persisted on the single app_settings row so
-// the owner's request is captured for fulfilment.
-router.post("/app-settings/camera-accessory/request", async (_req, res) => {
-  if (!(await canUseManagerDevices())) {
+// Bluetooth mini camera accessory. Persisted on the Owner's own app_settings
+// row so the owner's request is captured for fulfilment.
+router.post("/app-settings/camera-accessory/request", requireOwner, async (req, res) => {
+  const ownerId = effectiveOwnerId(req)!;
+  if (!(await canUseManagerDevices(ownerId))) {
     return res.status(403).json({ error: "The Bluetooth mini camera pairs with a manager device — add the manager-device add-on (₹199/month) first." });
   }
-  const settings = await getSettings();
+  const settings = await getSettings(ownerId);
   const [row] = await db
     .update(appSettingsTable)
     .set({ cameraAccessoryRequested: true, cameraAccessoryRequestedAt: new Date() })
@@ -508,8 +512,9 @@ router.post("/app-settings/camera-accessory/request", async (_req, res) => {
   return res.json(row);
 });
 
-router.post("/subscription/subscribe", async (req, res) => {
-  const settings = await getSettings();
+router.post("/subscription/subscribe", requireOwner, async (req, res) => {
+  const ownerId = effectiveOwnerId(req)!;
+  const settings = await getSettings(ownerId);
   const now = new Date();
 
   // The farmer picks a plan. There is a single Farmer plan (₹399/month),
@@ -540,10 +545,16 @@ router.post("/subscription/subscribe", async (req, res) => {
 // buy it (₹ADDON_DEVICE_PRICE per month); if an add-on is already active the
 // month is extended from the current expiry rather than from today. Auto-pay
 // (set from the owner's app) keeps renewing it every month.
-router.post("/subscription/manager-device-addon", async (req, res) => {
-  const settings = await getSettings();
+router.post("/subscription/manager-device-addon", requireOwner, async (req, res) => {
+  const ownerId = effectiveOwnerId(req)!;
+  const settings = await getSettings(ownerId);
   const now = new Date();
-  const { autoPay } = (req.body ?? {}) as { autoPay?: boolean };
+  const { autoPay, clientId } = (req.body ?? {}) as { autoPay?: boolean; clientId?: string };
+  // Idempotency: an offline-queued purchase replayed after a lost response
+  // must not extend the add-on a second time for the same purchase.
+  if (clientId && settings.deviceAddonLastKey === clientId) {
+    return res.json({ ...settings, managerDeviceAddonActive: isManagerDeviceAddonActive(settings, now) });
+  }
   const current = settings.managerDeviceAddonExpiresAt
     ? new Date(settings.managerDeviceAddonExpiresAt as unknown as string)
     : null;
@@ -557,6 +568,7 @@ router.post("/subscription/manager-device-addon", async (req, res) => {
       managerDeviceAddonAt: now,
       managerDeviceAddonExpiresAt: expiresAt,
       managerDeviceAutoPay: autoPay === true,
+      deviceAddonLastKey: clientId ?? null,
     })
     .where(eq(appSettingsTable.id, settings.id))
     .returning();
@@ -567,13 +579,18 @@ router.post("/subscription/manager-device-addon", async (req, res) => {
 // per extra estate per month). Each purchase raises the estate allowance by one,
 // so the owner can create one more estate in the switcher. Auto-pay keeps the
 // monthly charge renewing so the unlocked estates stay available.
-router.post("/subscription/estate-addon", async (req, res) => {
-  const settings = await getSettings();
-  const { autoPay } = (req.body ?? {}) as { autoPay?: boolean };
+router.post("/subscription/estate-addon", requireOwner, async (req, res) => {
+  const ownerId = effectiveOwnerId(req)!;
+  const settings = await getSettings(ownerId);
+  const { autoPay, clientId } = (req.body ?? {}) as { autoPay?: boolean; clientId?: string };
+  // Idempotency: a replayed offline purchase must not unlock a second estate.
+  if (clientId && settings.estateAddonLastKey === clientId) {
+    return res.json({ ...settings, maxEstates: BASE_ESTATE_ALLOWANCE + (settings.extraEstates ?? 0) });
+  }
   const extraEstates = (settings.extraEstates ?? 0) + 1;
   const [row] = await db
     .update(appSettingsTable)
-    .set({ extraEstates, estateAddonAutoPay: autoPay === true })
+    .set({ extraEstates, estateAddonAutoPay: autoPay === true, estateAddonLastKey: clientId ?? null })
     .where(eq(appSettingsTable.id, settings.id))
     .returning();
   return res.json({ ...row, maxEstates: BASE_ESTATE_ALLOWANCE + extraEstates });
@@ -598,7 +615,7 @@ router.post("/consultations", requireOwner, requireActiveSubscription, async (re
 
   const [consultation] = await db
     .insert(consultationsTable)
-    .values({ agronomistId: Number(agronomistId), mode: mode === "call" ? "call" : "chat", topic: topic ?? null })
+    .values({ ownerId: effectiveOwnerId(req)!, agronomistId: Number(agronomistId), mode: mode === "call" ? "call" : "chat", topic: topic ?? null })
     .returning();
 
   const greeting = `Namaste! I'm ${doc.name}, specialist in ${doc.speciality}. ${
@@ -613,8 +630,12 @@ router.post("/consultations", requireOwner, requireActiveSubscription, async (re
   return res.json(consultation);
 });
 
-router.get("/consultations/:id/messages", async (req, res) => {
+router.get("/consultations/:id/messages", requireOwner, async (req, res) => {
   const id = Number(req.params.id);
+  const consultRows = await db.select().from(consultationsTable).where(eq(consultationsTable.id, id)).limit(1);
+  if (consultRows.length === 0) return res.status(404).json({ error: "Consultation not found" });
+  if (consultRows[0].ownerId !== effectiveOwnerId(req)) return res.status(403).json({ error: "Not your consultation" });
+
   const rows = await db
     .select()
     .from(consultationMessagesTable)
@@ -623,20 +644,41 @@ router.get("/consultations/:id/messages", async (req, res) => {
   return res.json(rows);
 });
 
-router.post("/consultations/:id/messages", async (req, res) => {
+router.post("/consultations/:id/messages", requireOwner, async (req, res) => {
   const id = Number(req.params.id);
-  const { text } = req.body as { text?: string };
-  if (!text || !text.trim()) return res.status(400).json({ error: "text is required" });
+  const { text, mediaType, mediaUrl } = req.body as { text?: string; mediaType?: string; mediaUrl?: string };
+  const trimmedText = (text ?? "").trim();
+  const hasMedia = Boolean(mediaType && mediaUrl);
+  if (!trimmedText && !hasMedia) return res.status(400).json({ error: "text or media is required" });
+  if (hasMedia) {
+    if (mediaType !== "image" && mediaType !== "audio") {
+      return res.status(400).json({ error: "mediaType must be 'image' or 'audio'" });
+    }
+    if (typeof mediaUrl !== "string" || !mediaUrl.startsWith("data:")) {
+      return res.status(400).json({ error: "mediaUrl must be a data URL" });
+    }
+    // ~4MB base64 cap keeps rows small; client compresses well under this.
+    if (mediaUrl.length > 4 * 1024 * 1024) {
+      return res.status(413).json({ error: "That file is too large. Please send a smaller photo or a shorter voice note." });
+    }
+  }
 
   const consultRows = await db.select().from(consultationsTable).where(eq(consultationsTable.id, id)).limit(1);
   if (consultRows.length === 0) return res.status(404).json({ error: "Consultation not found" });
   const consultation = consultRows[0];
+  if (consultation.ownerId !== effectiveOwnerId(req)) return res.status(403).json({ error: "Not your consultation" });
   if (consultation.status !== "active") return res.status(400).json({ error: "Consultation has ended" });
 
   const docRows = await db.select().from(agronomistsTable).where(eq(agronomistsTable.id, consultation.agronomistId)).limit(1);
   const doc = docRows[0];
 
-  await db.insert(consultationMessagesTable).values({ consultationId: id, sender: "farmer", text: text.trim() });
+  await db.insert(consultationMessagesTable).values({
+    consultationId: id,
+    sender: "farmer",
+    text: trimmedText,
+    mediaType: hasMedia ? mediaType : null,
+    mediaUrl: hasMedia ? mediaUrl : null,
+  });
 
   const history = await db
     .select()
@@ -664,10 +706,26 @@ router.post("/consultations/:id/messages", async (req, res) => {
             `Use simple language. Be concise (4-8 short lines). Recommend safe, low-cost steps first. If a disease or pest is suspected, name it and the remedy with approximate dosage. ` +
             `If you need more detail, ask one or two specific questions. Do not mention being an AI.`,
         },
-        ...history.map((m) => ({
-          role: (m.sender === "farmer" ? "user" : "assistant") as "user" | "assistant",
-          content: m.text,
-        })),
+        ...history.map((m) => {
+          const role = (m.sender === "farmer" ? "user" : "assistant") as "user" | "assistant";
+          // Attach farmer photos so the doctor can actually see the problem.
+          if (role === "user" && m.mediaType === "image" && m.mediaUrl) {
+            return {
+              role: "user" as const,
+              content: [
+                { type: "text" as const, text: m.text || "The farmer sent this photo of the problem." },
+                { type: "image_url" as const, image_url: { url: m.mediaUrl } },
+              ],
+            };
+          }
+          if (role === "user" && m.mediaType === "audio") {
+            return {
+              role: "user" as const,
+              content: `${m.text ? m.text + "\n" : ""}[The farmer sent a voice note. If you could not hear it, kindly ask them to type or describe the problem briefly.]`,
+            };
+          }
+          return { role, content: m.text };
+        }),
       ],
     });
     reply = completion.choices[0]?.message?.content?.trim() || reply;
@@ -683,15 +741,16 @@ router.post("/consultations/:id/messages", async (req, res) => {
   return res.json(doctorMsg);
 });
 
-router.post("/consultations/:id/end", async (req, res) => {
+router.post("/consultations/:id/end", requireOwner, async (req, res) => {
   const id = Number(req.params.id);
   const consultRows = await db.select().from(consultationsTable).where(eq(consultationsTable.id, id)).limit(1);
   if (consultRows.length === 0) return res.status(404).json({ error: "Consultation not found" });
   const consultation = consultRows[0];
+  if (consultation.ownerId !== effectiveOwnerId(req)) return res.status(403).json({ error: "Not your consultation" });
 
   // Idempotent: if already ended, return stored result without re-charging.
   if (consultation.status === "ended") {
-    const s = await getSettings();
+    const s = await getSettings(consultation.ownerId);
     return res.json({
       ...consultation,
       cost: Number(consultation.cost),
@@ -716,7 +775,7 @@ router.post("/consultations/:id/end", async (req, res) => {
   const cost = Math.round(blocks * ratePer15 * 100) / 100;
   const { doctorEarning, platformFee } = splitRevenue(cost);
 
-  const settings = await getSettings();
+  const settings = await getSettings(consultation.ownerId);
 
   // Finalize the consultation and apply the revenue split atomically so a
   // partial failure can never leave the wallet, platform revenue, and doctor
@@ -761,7 +820,7 @@ router.post("/consultations/:id/end", async (req, res) => {
 
   if (!updated) {
     const fresh = await db.select().from(consultationsTable).where(eq(consultationsTable.id, id)).limit(1);
-    const s = await getSettings();
+    const s = await getSettings(consultation.ownerId);
     return res.json({
       ...fresh[0],
       cost: Number(fresh[0]?.cost) || 0,
@@ -776,8 +835,14 @@ router.post("/consultations/:id/end", async (req, res) => {
   return res.json({ ...updated, cost, doctorEarning, platformFee, minutes, blocks, ratePer15, walletBalance: newBalance });
 });
 
-router.get("/consultations", async (_req, res) => {
-  const rows = await db.select().from(consultationsTable).orderBy(desc(consultationsTable.startedAt)).limit(50);
+router.get("/consultations", requireOwner, async (req, res) => {
+  const ownerId = effectiveOwnerId(req)!;
+  const rows = await db
+    .select()
+    .from(consultationsTable)
+    .where(eq(consultationsTable.ownerId, ownerId))
+    .orderBy(desc(consultationsTable.startedAt))
+    .limit(50);
   return res.json(rows);
 });
 

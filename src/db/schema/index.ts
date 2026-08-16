@@ -4,3 +4,4 @@ export * from "./messages";
 export * from "./owners";
 export * from "./managers";
 export * from "./subscriptions";
+export * from "./wallet";

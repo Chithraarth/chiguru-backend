@@ -1,3 +1,4 @@
+import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { appSettingsTable } from "../db/schema";
 
@@ -106,9 +107,9 @@ function rollForwardMonthly(expiry: Date, now: Date, stepMonths: number): Date |
   return next > now ? next : null;
 }
 
-export async function getAppSettingsRow() {
-  const rows = await db.select().from(appSettingsTable).limit(1);
-  const row = rows.length > 0 ? rows[0] : (await db.insert(appSettingsTable).values({}).returning())[0];
+export async function getAppSettingsRow(ownerId: number) {
+  const rows = await db.select().from(appSettingsTable).where(eq(appSettingsTable.ownerId, ownerId)).limit(1);
+  const row = rows.length > 0 ? rows[0] : (await db.insert(appSettingsTable).values({ ownerId }).returning())[0];
 
   // Auto-pay: when the owner turned auto-pay on, an expired monthly charge
   // renews automatically — we roll the expiry forward instead of lapsing.
@@ -133,7 +134,6 @@ export async function getAppSettingsRow() {
     if (renewed) updates.managerDeviceAddonExpiresAt = renewed;
   }
   if (Object.keys(updates).length > 0) {
-    const { eq } = await import("drizzle-orm");
     const [updated] = await db
       .update(appSettingsTable)
       .set(updates)
@@ -153,11 +153,11 @@ export function isSubscriptionActive(s: SettingsRow, now: Date = new Date()): bo
   return now < new Date(s.subscriptionExpiresAt as unknown as string);
 }
 
-// Single-farm app (no auth): access is governed by the one app_settings row.
+// Per-Owner: access is governed by that Owner's own app_settings row.
 // Using Agri Doctor (consulting) is a regular feature — available during the
 // 30-day trial, and afterwards with any active plan (Silver, Gold or Platinum).
-export async function canUseAgriDoctor(): Promise<boolean> {
-  const s = await getAppSettingsRow();
+export async function canUseAgriDoctor(ownerId: number): Promise<boolean> {
+  const s = await getAppSettingsRow(ownerId);
   const { trialActive } = getTrial(new Date(s.trialStartDate as unknown as string));
   return trialActive || isSubscriptionActive(s);
 }
@@ -165,8 +165,8 @@ export async function canUseAgriDoctor(): Promise<boolean> {
 // Selling (Farmers Market produce, opening a Nursery/Supplies shop and listing
 // equipment) is now part of the single Farmer plan. It is available during the
 // 30-day trial, and afterwards with any active plan.
-export async function canSell(): Promise<boolean> {
-  const s = await getAppSettingsRow();
+export async function canSell(ownerId: number): Promise<boolean> {
+  const s = await getAppSettingsRow(ownerId);
   const { trialActive } = getTrial(new Date(s.trialStartDate as unknown as string));
   return trialActive || isSubscriptionActive(s);
 }
@@ -174,8 +174,8 @@ export async function canSell(): Promise<boolean> {
 // The "Zamindar" estate add-on permanently raises the estate allowance by one
 // per purchase. The base allowance is one free estate, so the maximum number of
 // estates a user may create is BASE_ESTATE_ALLOWANCE + extraEstates.
-export async function getMaxEstates(): Promise<number> {
-  const s = await getAppSettingsRow();
+export async function getMaxEstates(ownerId: number): Promise<number> {
+  const s = await getAppSettingsRow(ownerId);
   return BASE_ESTATE_ALLOWANCE + (s.extraEstates ?? 0);
 }
 
@@ -189,8 +189,8 @@ export function isManagerDeviceAddonActive(s: SettingsRow, now: Date = new Date(
 // their own phone) are a STANDALONE add-on — not bundled in any plan. Available
 // during the regular 30-day trial, and afterwards only with an active
 // manager-device add-on.
-export async function canUseManagerDevices(): Promise<boolean> {
-  const s = await getAppSettingsRow();
+export async function canUseManagerDevices(ownerId: number): Promise<boolean> {
+  const s = await getAppSettingsRow(ownerId);
   const { trialActive } = getTrial(new Date(s.trialStartDate as unknown as string));
   if (trialActive) return true;
   return isManagerDeviceAddonActive(s);
