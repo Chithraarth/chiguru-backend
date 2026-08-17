@@ -41,36 +41,44 @@ export async function firebaseAuthMiddleware(req: Request, _res: Response, next:
   try {
     const decoded = await firebaseAuth.verifyIdToken(token);
 
-    const [linkedManager] = await db
-      .select()
-      .from(managersTable)
-      .where(and(eq(managersTable.firebaseUid, decoded.uid), eq(managersTable.status, "active")));
-    if (linkedManager) {
-      req.manager = linkedManager;
-      return next();
-    }
-
-    if (decoded.phone_number) {
-      const [pendingInvite] = await db
-        .select()
-        .from(managersTable)
-        .where(and(eq(managersTable.phone, decoded.phone_number), eq(managersTable.status, "pending")))
-        .orderBy(managersTable.createdAt);
-      if (pendingInvite) {
-        const [activated] = await db
-          .update(managersTable)
-          .set({ firebaseUid: decoded.uid, status: "active", activatedAt: new Date() })
-          .where(eq(managersTable.id, pendingInvite.id))
-          .returning();
-        req.manager = activated;
-        return next();
-      }
-    }
-
+    // Owner identity always wins: the same phone number can be both a farm's
+    // own Owner and, separately, invited as a Manager on someone else's farm
+    // (e.g. an Owner helping test the pairing flow). If this UID already has
+    // an Owner row, this request is that Owner — full stop — even if it's
+    // also an active/pending Manager elsewhere. Only a UID with no Owner row
+    // of its own falls through to the Manager checks below.
     const [existing] = await db
       .select()
       .from(ownersTable)
       .where(eq(ownersTable.firebaseUid, decoded.uid));
+
+    if (!existing) {
+      const [linkedManager] = await db
+        .select()
+        .from(managersTable)
+        .where(and(eq(managersTable.firebaseUid, decoded.uid), eq(managersTable.status, "active")));
+      if (linkedManager) {
+        req.manager = linkedManager;
+        return next();
+      }
+
+      if (decoded.phone_number) {
+        const [pendingInvite] = await db
+          .select()
+          .from(managersTable)
+          .where(and(eq(managersTable.phone, decoded.phone_number), eq(managersTable.status, "pending")))
+          .orderBy(managersTable.createdAt);
+        if (pendingInvite) {
+          const [activated] = await db
+            .update(managersTable)
+            .set({ firebaseUid: decoded.uid, status: "active", activatedAt: new Date() })
+            .where(eq(managersTable.id, pendingInvite.id))
+            .returning();
+          req.manager = activated;
+          return next();
+        }
+      }
+    }
 
     if (existing) {
       const [updated] = await db
