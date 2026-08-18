@@ -19,8 +19,13 @@ import {
   handleGooglePlayNotification,
   SubscriptionServiceError,
 } from "../services/subscription.service";
-import { verifyWebhookSignature } from "../lib/razorpay";
+import { verifyWebhookSignature, createOneTimeOrder, verifyOrderPaymentSignature, RAZORPAY_KEY_ID } from "../lib/razorpay";
 import { logger } from "../lib/logger";
+
+// One-time price for a permanent +1 manager seat add-on — never expires,
+// unlike a subscription. Fixed (not user-entered) since this buys exactly
+// one seat.
+const MANAGER_SEAT_ADDON_PRICE = 199;
 
 const router: IRouter = Router();
 
@@ -57,12 +62,13 @@ router.get("/subscriptions/plans", async (_req, res) => {
 // GET /api/subscriptions/me — Owner derived from the verified Firebase token only.
 router.get("/subscriptions/me", requireOwner, async (req, res) => {
   const ownerId = req.owner!.id;
-  const [sub, plan, managerLimit, managersUsed, remainingManagers] = await Promise.all([
+  const [sub, plan, managerLimit, managersUsed, remainingManagers, [owner]] = await Promise.all([
     getCurrentSubscription(ownerId),
     getPlan(ownerId),
     getManagerLimit(ownerId),
     getManagersUsed(ownerId),
     getRemainingManagerSeats(ownerId),
+    db.select({ extraManagerSeats: ownersTable.extraManagerSeats }).from(ownersTable).where(eq(ownersTable.id, ownerId)),
   ]);
 
   res.json({
@@ -78,8 +84,75 @@ router.get("/subscriptions/me", requireOwner, async (req, res) => {
           plan: plan ? { id: plan.id, name: plan.name, managerLimit: plan.managerLimit, price: Number(plan.price) } : null,
         }
       : null,
-    entitlement: { managerLimit, managersUsed, remainingManagers },
+    entitlement: {
+      managerLimit,
+      managersUsed,
+      remainingManagers,
+      extraManagerSeats: owner?.extraManagerSeats ?? 0,
+      managerSeatAddonPrice: MANAGER_SEAT_ADDON_PRICE,
+    },
   });
+});
+
+/** Step 1 of a manager-seat add-on purchase: create the fixed-price Razorpay order the client's checkout.js opens. */
+router.post("/subscriptions/manager-seat-addon/order", requireOwner, async (req, res) => {
+  const order = await createOneTimeOrder(MANAGER_SEAT_ADDON_PRICE, req.owner!.id, "manager_seat_addon");
+  res.json({ ...order, keyId: RAZORPAY_KEY_ID });
+});
+
+/**
+ * Step 2: verify the signature, then permanently add +1 manager seat.
+ * Idempotent via payments.provider_payment_id's unique constraint — a
+ * retried verify call with the same Razorpay payment id can never
+ * double-credit a seat.
+ */
+router.post("/subscriptions/manager-seat-addon/verify", requireOwner, async (req, res) => {
+  const { orderId, paymentId, signature } = req.body as { orderId?: string; paymentId?: string; signature?: string };
+  if (!orderId || !paymentId || !signature) {
+    res.status(400).json({ message: "orderId, paymentId and signature are required", code: "INVALID_REQUEST" });
+    return;
+  }
+  const valid = verifyOrderPaymentSignature(orderId, paymentId, signature);
+  if (!valid) {
+    res.status(400).json({ message: "Payment verification failed", code: "VERIFICATION_FAILED" });
+    return;
+  }
+
+  const ownerId = req.owner!.id;
+  const result = await db.transaction(async (tx) => {
+    const existing = await tx
+      .select({ id: paymentsTable.id })
+      .from(paymentsTable)
+      .where(eq(paymentsTable.providerPaymentId, paymentId))
+      .limit(1);
+
+    const [owner] = await tx
+      .select({ extraManagerSeats: ownersTable.extraManagerSeats })
+      .from(ownersTable)
+      .where(eq(ownersTable.id, ownerId))
+      .for("update");
+
+    if (existing[0]) return { extraManagerSeats: owner?.extraManagerSeats ?? 0, duplicate: true };
+
+    const [updated] = await tx
+      .update(ownersTable)
+      .set({ extraManagerSeats: (owner?.extraManagerSeats ?? 0) + 1, updatedAt: new Date() })
+      .where(eq(ownersTable.id, ownerId))
+      .returning({ extraManagerSeats: ownersTable.extraManagerSeats });
+
+    await tx.insert(paymentsTable).values({
+      ownerId,
+      provider: "RAZORPAY",
+      providerPaymentId: paymentId,
+      amount: String(MANAGER_SEAT_ADDON_PRICE),
+      paymentStatus: "succeeded",
+      paymentDate: new Date(),
+    });
+
+    return { extraManagerSeats: updated.extraManagerSeats, duplicate: false };
+  });
+
+  res.json({ ok: true, ...result });
 });
 
 // POST /api/subscriptions/razorpay/create — body {planId} only. Everything

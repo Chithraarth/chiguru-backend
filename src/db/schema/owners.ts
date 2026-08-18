@@ -2,6 +2,7 @@ import {
   pgTable,
   serial,
   text,
+  integer,
   timestamp,
 } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
@@ -24,6 +25,10 @@ export const ownersTable = pgTable("owners", {
   loginProvider: text("login_provider"),
   role: text("role").notNull().default("OWNER"),
   status: text("status").notNull().default("ACTIVE"),
+  // One-time ₹199 purchase permanently adds +1 manager seat on top of the
+  // plan's included limit — never expires, unlike a subscription. See
+  // routes/subscription.ts POST /subscriptions/manager-seat-addon.
+  extraManagerSeats: integer("extra_manager_seats").notNull().default(0),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
   lastLogin: timestamp("last_login").notNull().defaultNow(),

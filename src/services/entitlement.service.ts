@@ -1,5 +1,5 @@
 import { eq, and, desc, sql } from "drizzle-orm";
-import { db, subscriptionsTable, subscriptionPlansTable, managersTable, type Subscription, type SubscriptionPlan } from "../db";
+import { db, subscriptionsTable, subscriptionPlansTable, managersTable, ownersTable, type Subscription, type SubscriptionPlan } from "../db";
 
 const ACTIVE_LIKE_STATUSES = ["ACTIVE", "GRACE_PERIOD"];
 
@@ -39,7 +39,8 @@ export async function isSubscriptionActive(ownerId: number): Promise<boolean> {
 export async function getManagerLimit(ownerId: number): Promise<number> {
   if (!(await isSubscriptionActive(ownerId))) return 0;
   const plan = await getPlan(ownerId);
-  return plan?.managerLimit ?? 0;
+  const [owner] = await db.select({ extraManagerSeats: ownersTable.extraManagerSeats }).from(ownersTable).where(eq(ownersTable.id, ownerId));
+  return (plan?.managerLimit ?? 0) + (owner?.extraManagerSeats ?? 0);
 }
 
 export async function getManagersUsed(ownerId: number): Promise<number> {

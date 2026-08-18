@@ -64,12 +64,12 @@ export function verifyCheckoutSignature(paymentId: string, subscriptionId: strin
   );
 }
 
-/** One-time order (e.g. a wallet recharge) — creates the Razorpay order the client's checkout.js opens. */
-export async function createRechargeOrder(amountRupees: number, ownerId: number): Promise<{ orderId: string; amount: number; currency: string }> {
+/** One-time order (e.g. a wallet recharge or a manager-seat add-on) — creates the Razorpay order the client's checkout.js opens. */
+export async function createOneTimeOrder(amountRupees: number, ownerId: number, purpose: string): Promise<{ orderId: string; amount: number; currency: string }> {
   const order = await razorpay.orders.create({
     amount: Math.round(amountRupees * 100),
     currency: "INR",
-    notes: { ownerId: String(ownerId), purpose: "wallet_recharge" },
+    notes: { ownerId: String(ownerId), purpose },
   });
   return { orderId: order.id, amount: amountRupees, currency: order.currency };
 }

@@ -1,7 +1,7 @@
 import { Router, type IRouter } from "express";
 import { requireOwner } from "../middlewares/firebaseAuth";
 import { MIN_RECHARGE_AMOUNT, SHARE_TARGET, AI_PRICES, getWalletState, getWalletHistory, creditWallet, recordShare } from "../lib/wallet";
-import { createRechargeOrder, verifyOrderPaymentSignature, RAZORPAY_KEY_ID } from "../lib/razorpay";
+import { createOneTimeOrder, verifyOrderPaymentSignature, RAZORPAY_KEY_ID } from "../lib/razorpay";
 
 const router: IRouter = Router();
 
@@ -37,7 +37,7 @@ router.post("/wallet/recharge/order", requireOwner, async (req, res) => {
     res.status(400).json({ message: `amount must be at least ₹${MIN_RECHARGE_AMOUNT}`, code: "INVALID_AMOUNT" });
     return;
   }
-  const order = await createRechargeOrder(amt, req.owner!.id);
+  const order = await createOneTimeOrder(amt, req.owner!.id, "wallet_recharge");
   res.json({ ...order, keyId: RAZORPAY_KEY_ID });
 });
 
