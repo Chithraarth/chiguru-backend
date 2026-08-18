@@ -1,6 +1,7 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { appSettingsTable } from "../db/schema";
+import { isSubscriptionActive as isRealSubscriptionActive } from "../services/entitlement.service";
 
 export interface Plan {
   id: string;
@@ -153,22 +154,25 @@ export function isSubscriptionActive(s: SettingsRow, now: Date = new Date()): bo
   return now < new Date(s.subscriptionExpiresAt as unknown as string);
 }
 
-// Per-Owner: access is governed by that Owner's own app_settings row.
 // Using Agri Doctor (consulting) is a regular feature — available during the
-// 30-day trial, and afterwards with any active plan (Silver, Gold or Platinum).
+// 30-day trial, and afterwards with any active Basic/Premium/Pro plan. Checks
+// the real subscriptionsTable (via entitlement.service.ts) rather than only
+// this file's own legacy app_settings.subscriptionPlan, which nothing writes
+// to anymore since the app moved off the old single-tier Farmer plan.
 export async function canUseAgriDoctor(ownerId: number): Promise<boolean> {
   const s = await getAppSettingsRow(ownerId);
   const { trialActive } = getTrial(new Date(s.trialStartDate as unknown as string));
-  return trialActive || isSubscriptionActive(s);
+  return trialActive || isSubscriptionActive(s) || (await isRealSubscriptionActive(ownerId));
 }
 
 // Selling (Farmers Market produce, opening a Nursery/Supplies shop and listing
-// equipment) is now part of the single Farmer plan. It is available during the
-// 30-day trial, and afterwards with any active plan.
+// equipment) is now part of every paid plan. Available during the 30-day
+// trial, and afterwards with any active Basic/Premium/Pro plan — see the
+// canUseAgriDoctor comment above for why both subscription sources are checked.
 export async function canSell(ownerId: number): Promise<boolean> {
   const s = await getAppSettingsRow(ownerId);
   const { trialActive } = getTrial(new Date(s.trialStartDate as unknown as string));
-  return trialActive || isSubscriptionActive(s);
+  return trialActive || isSubscriptionActive(s) || (await isRealSubscriptionActive(ownerId));
 }
 
 // The "Zamindar" estate add-on permanently raises the estate allowance by one
