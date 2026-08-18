@@ -16,7 +16,8 @@ import { db, walletBalancesTable, walletTransactionsTable } from "../db";
  * included in any API response — the Owner always sees one single charge.
  */
 
-export const RECHARGE_AMOUNTS = [5000, 10000];
+/** Owner picks any amount to recharge — this is just a floor, not a fixed list. */
+export const MIN_RECHARGE_AMOUNT = 199;
 /** Share the app on 3 different social platforms → one-time wallet credit. */
 export const SHARE_REWARD = 300;
 export const SHARE_TARGET = 3;

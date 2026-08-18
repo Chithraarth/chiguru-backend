@@ -1,6 +1,6 @@
 import { Router, type IRouter } from "express";
 import { requireOwner } from "../middlewares/firebaseAuth";
-import { RECHARGE_AMOUNTS, SHARE_TARGET, AI_PRICES, getWalletState, getWalletHistory, creditWallet, recordShare } from "../lib/wallet";
+import { MIN_RECHARGE_AMOUNT, SHARE_TARGET, AI_PRICES, getWalletState, getWalletHistory, creditWallet, recordShare } from "../lib/wallet";
 import { createRechargeOrder, verifyOrderPaymentSignature, RAZORPAY_KEY_ID } from "../lib/razorpay";
 
 const router: IRouter = Router();
@@ -17,7 +17,7 @@ router.get("/wallet", requireOwner, async (req, res) => {
   const [state, history] = await Promise.all([getWalletState(ownerId), getWalletHistory(ownerId)]);
   res.json({
     balance: state.balance,
-    rechargeAmounts: RECHARGE_AMOUNTS,
+    minRechargeAmount: MIN_RECHARGE_AMOUNT,
     aiPrices: Object.fromEntries(Object.entries(AI_PRICES).map(([k, v]) => [k, { price: v.price, label: v.label }])),
     share: {
       target: SHARE_TARGET,
@@ -32,11 +32,12 @@ router.get("/wallet", requireOwner, async (req, res) => {
 /** Step 1 of a recharge: create the Razorpay order the client's checkout.js opens. */
 router.post("/wallet/recharge/order", requireOwner, async (req, res) => {
   const { amount } = req.body as { amount?: number };
-  if (!RECHARGE_AMOUNTS.includes(Number(amount))) {
-    res.status(400).json({ message: `amount must be one of: ${RECHARGE_AMOUNTS.join(", ")}`, code: "INVALID_AMOUNT" });
+  const amt = Number(amount);
+  if (!Number.isFinite(amt) || amt < MIN_RECHARGE_AMOUNT) {
+    res.status(400).json({ message: `amount must be at least ₹${MIN_RECHARGE_AMOUNT}`, code: "INVALID_AMOUNT" });
     return;
   }
-  const order = await createRechargeOrder(Number(amount), req.owner!.id);
+  const order = await createRechargeOrder(amt, req.owner!.id);
   res.json({ ...order, keyId: RAZORPAY_KEY_ID });
 });
 
@@ -45,7 +46,8 @@ router.post("/wallet/recharge/verify", requireOwner, async (req, res) => {
   const { orderId, paymentId, signature, amount } = req.body as {
     orderId?: string; paymentId?: string; signature?: string; amount?: number;
   };
-  if (!orderId || !paymentId || !signature || !RECHARGE_AMOUNTS.includes(Number(amount))) {
+  const amt = Number(amount);
+  if (!orderId || !paymentId || !signature || !Number.isFinite(amt) || amt < MIN_RECHARGE_AMOUNT) {
     res.status(400).json({ message: "orderId, paymentId, signature and a valid amount are required", code: "INVALID_REQUEST" });
     return;
   }
@@ -57,7 +59,7 @@ router.post("/wallet/recharge/verify", requireOwner, async (req, res) => {
   const result = await creditWallet({
     ownerId: req.owner!.id,
     type: "recharge",
-    amount: Number(amount),
+    amount: amt,
     clientId: paymentId, // Razorpay's payment id is already globally unique — a retried verify call can never double-credit.
   });
   res.json({ ok: true, balance: result.balance, duplicate: result.duplicate });
