@@ -19,19 +19,16 @@ declare global {
 /**
  * Verifies a Firebase ID token (Authorization: Bearer <token>) if present.
  *
- * Managers are checked FIRST: if the token's UID is already linked to a
- * managers row, or its phone number matches a still-"pending" invite from an
- * Owner, this request is a Manager — req.manager is attached and we return
- * without ever touching the owners table. This matters because a manager's
- * very first phone-OTP sign-in would otherwise fall through to the Owner
- * upsert below and silently create a bogus Owner account for them.
- *
- * Otherwise this is a normal Owner sign-in (email/Google/Facebook/phone) and
- * the existing upsert-on-every-request behavior applies unchanged.
+ * A single phone number can legitimately be an Owner on their own farm AND,
+ * separately, an invited Manager on someone else's farm — so this attaches
+ * BOTH req.owner and req.manager whenever both exist, rather than picking
+ * one. Which identity a request actually acts as is decided per-route by
+ * requireOwner/requireManager below (the Owner apps only ever call
+ * owner-gated routes; the Manager apps only ever call manager-gated ones),
+ * not by this middleware guessing.
  *
  * Never blocks the request itself — an invalid/missing token, or one that
- * matches neither, just leaves req.owner/req.manager unset; routes that
- * require one use requireOwner/requireManager below.
+ * matches neither, just leaves req.owner/req.manager unset.
  */
 export async function firebaseAuthMiddleware(req: Request, _res: Response, next: NextFunction) {
   const header = req.headers.authorization;
@@ -41,42 +38,30 @@ export async function firebaseAuthMiddleware(req: Request, _res: Response, next:
   try {
     const decoded = await firebaseAuth.verifyIdToken(token);
 
-    // Owner identity always wins: the same phone number can be both a farm's
-    // own Owner and, separately, invited as a Manager on someone else's farm
-    // (e.g. an Owner helping test the pairing flow). If this UID already has
-    // an Owner row, this request is that Owner — full stop — even if it's
-    // also an active/pending Manager elsewhere. Only a UID with no Owner row
-    // of its own falls through to the Manager checks below.
     const [existing] = await db
       .select()
       .from(ownersTable)
       .where(eq(ownersTable.firebaseUid, decoded.uid));
 
-    if (!existing) {
-      const [linkedManager] = await db
+    const [linkedManager] = await db
+      .select()
+      .from(managersTable)
+      .where(and(eq(managersTable.firebaseUid, decoded.uid), eq(managersTable.status, "active")));
+    if (linkedManager) {
+      req.manager = linkedManager;
+    } else if (decoded.phone_number) {
+      const [pendingInvite] = await db
         .select()
         .from(managersTable)
-        .where(and(eq(managersTable.firebaseUid, decoded.uid), eq(managersTable.status, "active")));
-      if (linkedManager) {
-        req.manager = linkedManager;
-        return next();
-      }
-
-      if (decoded.phone_number) {
-        const [pendingInvite] = await db
-          .select()
-          .from(managersTable)
-          .where(and(eq(managersTable.phone, decoded.phone_number), eq(managersTable.status, "pending")))
-          .orderBy(managersTable.createdAt);
-        if (pendingInvite) {
-          const [activated] = await db
-            .update(managersTable)
-            .set({ firebaseUid: decoded.uid, status: "active", activatedAt: new Date() })
-            .where(eq(managersTable.id, pendingInvite.id))
-            .returning();
-          req.manager = activated;
-          return next();
-        }
+        .where(and(eq(managersTable.phone, decoded.phone_number), eq(managersTable.status, "pending")))
+        .orderBy(managersTable.createdAt);
+      if (pendingInvite) {
+        const [activated] = await db
+          .update(managersTable)
+          .set({ firebaseUid: decoded.uid, status: "active", activatedAt: new Date() })
+          .where(eq(managersTable.id, pendingInvite.id))
+          .returning();
+        req.manager = activated;
       }
     }
 
@@ -95,7 +80,10 @@ export async function firebaseAuthMiddleware(req: Request, _res: Response, next:
         .where(eq(ownersTable.id, existing.id))
         .returning();
       req.owner = updated;
-    } else {
+    } else if (!req.manager) {
+      // Only auto-create an Owner account for a UID with no Owner row of its
+      // own AND no Manager identity either — a Manager's very first
+      // phone-OTP sign-in must never silently create a bogus Owner account.
       const [created] = await db
         .insert(ownersTable)
         .values({
@@ -147,7 +135,21 @@ export function requireOwnerOrManager(req: Request, res: Response, next: NextFun
   next();
 }
 
-/** The effective Owner id this request is scoped to, whether Owner or Manager. */
+/**
+ * The effective Owner id this request is scoped to, whether Owner or
+ * Manager. Almost always unambiguous (a token resolves to only one of
+ * req.owner/req.manager) — but one phone number can legitimately be an
+ * Owner on their own farm AND an invited Manager on someone else's, in
+ * which case both are set and only the calling app knows which farm it
+ * means. Every client sends X-Actor-Role ("owner" | "manager") precisely so
+ * this can disambiguate instead of guessing; an old/missing header falls
+ * back to the historical owner-first preference.
+ */
 export function effectiveOwnerId(req: Request): number | null {
+  if (req.owner && req.manager) {
+    const role = req.header("X-Actor-Role");
+    if (role === "manager") return req.manager.ownerId;
+    return req.owner.id;
+  }
   return req.owner?.id ?? req.manager?.ownerId ?? null;
 }
