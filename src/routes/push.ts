@@ -2,14 +2,15 @@ import { Router } from "express";
 import { db } from "../db";
 import { pushDevicesTable, planTasksTable, farmProfileTable } from "../db/schema";
 import { eq, and, ne, isNull, or } from "drizzle-orm";
+import { effectiveOwnerId } from "../middlewares/firebaseAuth";
 
 const router = Router();
 
 // Same estate-scoping convention as farm.ts / year-plan.ts.
 async function activeEstateId(
-  req: { header(name: string): string | undefined; owner?: { id: number }; manager?: { ownerId: number } },
+  req: Parameters<typeof effectiveOwnerId>[0],
 ): Promise<number | null> {
-  const ownerId = req.owner?.id ?? req.manager?.ownerId;
+  const ownerId = effectiveOwnerId(req) ?? undefined;
   const h = req.header("X-Estate-Id");
   const headerEid = h && !isNaN(Number(h)) ? Number(h) : null;
 

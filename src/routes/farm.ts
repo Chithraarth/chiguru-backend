@@ -46,9 +46,9 @@ const router = Router();
 // Resolve the active estate id for a request: the X-Estate-Id header if valid,
 // otherwise the oldest estate (first onboarded). Returns null when none exist yet.
 async function activeEstateId(
-  req: { header(name: string): string | undefined; owner?: { id: number }; manager?: { ownerId: number } },
+  req: Parameters<typeof effectiveOwnerId>[0],
 ): Promise<number | null> {
-  const ownerId = req.owner?.id ?? req.manager?.ownerId;
+  const ownerId = effectiveOwnerId(req) ?? undefined;
   const h = req.header("X-Estate-Id");
   const headerEid = h && !isNaN(Number(h)) ? Number(h) : null;
 

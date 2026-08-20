@@ -22,9 +22,9 @@ function requireWalletCredit(feature: string) {
 // header must belong to that Owner; unauthenticated/legacy calls fall back to
 // the oldest estate when the header is missing.
 async function activeEstateId(
-  req: { header(name: string): string | undefined; owner?: { id: number }; manager?: { ownerId: number } },
+  req: Parameters<typeof effectiveOwnerId>[0],
 ): Promise<number | null> {
-  const ownerId = req.owner?.id ?? req.manager?.ownerId;
+  const ownerId = effectiveOwnerId(req) ?? undefined;
   const h = req.header("X-Estate-Id");
   const headerEid = h && !isNaN(Number(h)) ? Number(h) : null;
 
