@@ -8,7 +8,7 @@ import {
   appSettingsTable,
   farmProfileTable,
 } from "../db/schema";
-import { openai } from "../integrations-openai-ai-server";
+import { geminiChat, type ChatTurn, GEMINI_PRO_MODEL } from "../integrations-gemini-ai-server";
 import { eq, and, asc, desc, sql } from "drizzle-orm";
 import {
   PLANS,
@@ -693,42 +693,29 @@ router.post("/consultations/:id/messages", requireOwner, async (req, res) => {
 
   let reply = "I'm having trouble responding right now. Please try again, or call me using the number on my profile.";
   try {
-    const completion = await openai.chat.completions.create({
-      model: "gpt-5.4",
-      max_completion_tokens: 600,
-      messages: [
-        {
-          role: "system",
-          content:
-            `You are ${doc?.name ?? "an agriculture doctor"}, an Indian agronomist specialising in ${doc?.speciality ?? "agriculture"} ` +
-            `(${doc?.qualification ?? ""}, ${doc?.experience ?? ""} experience). ${farmContext} ` +
-            `You are consulting a smallholder Indian farmer. Give practical, affordable, locally-relevant advice to diagnose problems and improve yield. ` +
-            `Use simple language. Be concise (4-8 short lines). Recommend safe, low-cost steps first. If a disease or pest is suspected, name it and the remedy with approximate dosage. ` +
-            `If you need more detail, ask one or two specific questions. Do not mention being an AI.`,
-        },
-        ...history.map((m) => {
-          const role = (m.sender === "farmer" ? "user" : "assistant") as "user" | "assistant";
-          // Attach farmer photos so the doctor can actually see the problem.
-          if (role === "user" && m.mediaType === "image" && m.mediaUrl) {
-            return {
-              role: "user" as const,
-              content: [
-                { type: "text" as const, text: m.text || "The farmer sent this photo of the problem." },
-                { type: "image_url" as const, image_url: { url: m.mediaUrl } },
-              ],
-            };
-          }
-          if (role === "user" && m.mediaType === "audio") {
-            return {
-              role: "user" as const,
-              content: `${m.text ? m.text + "\n" : ""}[The farmer sent a voice note. If you could not hear it, kindly ask them to type or describe the problem briefly.]`,
-            };
-          }
-          return { role, content: m.text };
-        }),
-      ],
+    const systemPrompt =
+      `You are ${doc?.name ?? "an agriculture doctor"}, an Indian agronomist specialising in ${doc?.speciality ?? "agriculture"} ` +
+      `(${doc?.qualification ?? ""}, ${doc?.experience ?? ""} experience). ${farmContext} ` +
+      `You are consulting a smallholder Indian farmer. Give practical, affordable, locally-relevant advice to diagnose problems and improve yield. ` +
+      `Use simple language. Be concise (4-8 short lines). Recommend safe, low-cost steps first. If a disease or pest is suspected, name it and the remedy with approximate dosage. ` +
+      `If you need more detail, ask one or two specific questions. Do not mention being an AI.`;
+
+    const chatHistory: ChatTurn[] = history.map((m) => {
+      const role = (m.sender === "farmer" ? "user" : "assistant") as "user" | "assistant";
+      // Attach farmer photos so the doctor can actually see the problem.
+      if (role === "user" && m.mediaType === "image" && m.mediaUrl) {
+        return { role, content: m.text || "The farmer sent this photo of the problem.", imageDataUrl: m.mediaUrl };
+      }
+      if (role === "user" && m.mediaType === "audio") {
+        return {
+          role,
+          content: `${m.text ? m.text + "\n" : ""}[The farmer sent a voice note. If you could not hear it, kindly ask them to type or describe the problem briefly.]`,
+        };
+      }
+      return { role, content: m.text ?? "" };
     });
-    reply = completion.choices[0]?.message?.content?.trim() || reply;
+
+    reply = (await geminiChat({ systemPrompt, history: chatHistory, model: GEMINI_PRO_MODEL, maxOutputTokens: 1500 })) || reply;
   } catch (err) {
     console.error("agri-doctor reply error:", err);
   }

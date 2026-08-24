@@ -27,7 +27,7 @@ import {
   userDevicesTable,
   planTasksTable,
 } from "../db/schema";
-import { openai } from "../integrations-openai-ai-server";
+import { geminiChat, geminiSearch } from "../integrations-gemini-ai-server";
 import { requestOwnerKey, bodyOwnerKey } from "../lib/owner-key";
 import { sendSuggestionEmail } from "../lib/gmail";
 import { eq, and, or, gte, lte, lt, sql, desc, inArray, isNull, isNotNull } from "drizzle-orm";
@@ -1713,13 +1713,11 @@ Write a clear final season account in simple Hindi-English (Hinglish) language s
 
 Keep it short, practical, and formatted with clear sections.`;
 
-  const aiResp = await openai.chat.completions.create({
-    model: "gpt-4.1-mini",
-    messages: [{ role: "user", content: prompt }],
-    max_completion_tokens: 900,
+  const aiSummary = await geminiChat({
+    systemPrompt: "You write clear, practical farm season-account summaries for Indian farm owners.",
+    history: [{ role: "user", content: prompt }],
+    maxOutputTokens: 900,
   });
-
-  const aiSummary = aiResp.choices[0]?.message?.content ?? "";
 
   await db.update(workGroupsTable)
     .set({ seasonClosed: true, seasonSummary: aiSummary })
@@ -2024,16 +2022,12 @@ Guidelines:
 - Never invent app features that are not listed above.
 - Reply as "Chiguru Helpline". NEVER say you are an AI, a bot, an assistant or a language model — even if asked directly. If asked who you are, say you are the Chiguru helpline team.`;
 
-    const completion = await openai.chat.completions.create({
-      model: "gpt-5.1",
-      max_completion_tokens: 2048,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: question },
-      ],
+    const answer = await geminiChat({
+      systemPrompt,
+      history: [{ role: "user", content: question }],
+      maxOutputTokens: 2048,
     });
-    const answer = completion.choices[0]?.message?.content?.trim();
-    return answer || null;
+    return answer.trim() || null;
   } catch (err) {
     console.error("Help AI answer failed:", err);
     return null;
@@ -3279,24 +3273,19 @@ router.post("/estate-updates/count-workers", async (req, res) => {
   const { imageDataUrl } = req.body as { imageDataUrl?: string };
   if (!imageDataUrl) return res.status(400).json({ error: "imageDataUrl required" });
   try {
-    const { openai } = await import("../integrations-openai-ai-server");
-    const response = await openai.chat.completions.create({
-      model: "gpt-5.4",
-      max_completion_tokens: 256,
-      messages: [{
-        role: "user",
-        content: [
-          { type: "image_url", image_url: { url: imageDataUrl } },
-          {
-            type: "text",
-            text: 'Count every person or worker visible in this farm field photo. Reply ONLY with valid JSON (no markdown, no extra text): {"count": <number>, "description": "<brief 1-line note in English>"}. If no people are visible, use count 0.',
-          },
-        ],
-      }],
+    const { geminiAnalyzeImage, Type } = await import("../integrations-gemini-ai-server");
+    const result = await geminiAnalyzeImage<{ count: number; description: string }>({
+      prompt: "Count every person or worker visible in this farm field photo. If no people are visible, use count 0.",
+      imageBase64: imageDataUrl,
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          count: { type: Type.INTEGER },
+          description: { type: Type.STRING, description: "Brief 1-line note in English" },
+        },
+        required: ["count", "description"],
+      },
     });
-    const text = response.choices[0]?.message?.content ?? '{"count":0}';
-    const m = text.match(/\{[^}]+\}/);
-    const result = m ? JSON.parse(m[0]) : { count: 0, description: "Could not detect workers" };
     return res.json({ count: Number(result.count) || 0, description: String(result.description ?? "") });
   } catch (err) {
     console.error("count-workers error:", err);
@@ -3893,12 +3882,7 @@ async function runMandiFetch(eid: number | null, day: string): Promise<void> {
     for (let attempt = 1; attempt <= 2 && rows.length === 0; attempt++) {
       // Hard timeout so a hung search can never leave the log stuck on
       // "pending" past the stale window.
-      const response = await openai.responses.create({
-        model: "gpt-5.4",
-        tools: [{ type: "web_search" }],
-        input: prompt,
-      }, { timeout: 4 * 60 * 1000 });
-      const text = response.output_text ?? "";
+      const text = await geminiSearch({ prompt, timeoutMs: 4 * 60 * 1000 });
       const start = text.indexOf("[");
       const end = text.lastIndexOf("]");
       if (start === -1 || end === -1 || end <= start) {

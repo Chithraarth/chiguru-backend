@@ -3,7 +3,7 @@ import { Router } from "express";
 import { db } from "../db";
 import { conversations, messages, farmProfileTable, cropsTable, expensesTable, spraysTable, harvestsTable, diseaseDiagnosesTable } from "../db";
 import { eq, asc, gte } from "drizzle-orm";
-import { openai } from "../integrations-openai-ai-server";
+import { geminiAnalyzeImage, geminiChat, geminiChatStream, type ChatTurn, Type, GEMINI_PRO_MODEL } from "../integrations-gemini-ai-server";
 import { CROP_DISEASE_KNOWLEDGE } from "../lib/crop-diseases";
 import { requireActiveSubscription } from "../middlewares/subscriptionGate";
 import { effectiveOwnerId } from "../middlewares/firebaseAuth";
@@ -116,10 +116,7 @@ Guidelines:
 - Base advice on well-established, widely-recommended practice (product label rates, KVK/ICAR guidance). Cross-check the common recommendation instead of guessing; if the evidence is weak, say so and advise a small test patch first. Never invent a dose.
 - End any answer that recommends a chemical, pesticide or dosage with this exact line on its own: "⚠️ Follow the product label for exact dose and safety. Test on a few plants first. This is general guidance, not a guarantee — for serious cases confirm with your local KVK before spraying."`;
 
-  const chatMessages = [
-    { role: "system" as const, content: systemPrompt },
-    ...history.map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
-  ];
+  const chatHistory: ChatTurn[] = history.map((m) => ({ role: m.role as "user" | "assistant", content: m.content }));
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -127,19 +124,9 @@ Guidelines:
 
   let fullResponse = "";
   try {
-    const stream = await openai.chat.completions.create({
-      model: "gpt-5.1",
-      max_completion_tokens: 8192,
-      messages: chatMessages,
-      stream: true,
-    });
-
-    for await (const chunk of stream) {
-      const text = chunk.choices[0]?.delta?.content;
-      if (text) {
-        fullResponse += text;
-        res.write(`data: ${JSON.stringify({ content: text })}\n\n`);
-      }
+    for await (const text of geminiChatStream({ systemPrompt, history: chatHistory })) {
+      fullResponse += text;
+      res.write(`data: ${JSON.stringify({ content: text })}\n\n`);
     }
 
     await db.insert(messages).values({ conversationId: id, role: "assistant", content: fullResponse });
@@ -208,18 +195,14 @@ Guidelines:
 - End any answer that recommends a chemical, pesticide or dosage with this exact line on its own: "⚠️ Follow the product label for exact dose and safety. Test on a few plants first. This is general guidance, not a guarantee — for serious cases confirm with your local KVK before spraying."`;
 
   try {
-    const completion = await openai.chat.completions.create({
-      model: "gpt-5.1",
-      max_completion_tokens: 2048,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: message },
-      ],
+    const response = await geminiChat({
+      systemPrompt,
+      history: [{ role: "user", content: message }],
+      maxOutputTokens: 2048,
     });
 
-    const response = completion.choices[0]?.message?.content ?? "I could not process your question. Please try again.";
     await chargeAISafe(effectiveOwnerId(req)!, "ai_chat");
-    res.json({ response, farmContextAvailable: !!profile });
+    res.json({ response: response || "I could not process your question. Please try again.", farmContextAvailable: !!profile });
   } catch (err) {
     console.error("AI chat error:", err);
     res.status(500).json({ error: "AI service error. Please try again." });
@@ -285,37 +268,50 @@ IMPORTANT for treatment steps:
 
 ${CROP_DISEASE_KNOWLEDGE}`;
 
+  const dataUrl = imageBase64.startsWith("data:") ? imageBase64 : `data:image/jpeg;base64,${imageBase64}`;
+
   try {
-    const dataUrl = imageBase64.startsWith("data:") ? imageBase64 : `data:image/jpeg;base64,${imageBase64}`;
-
-    const response = await openai.chat.completions.create({
-      model: "gpt-5.4",
-      max_completion_tokens: 1600,
-      messages: [
-        { role: "system", content: systemPrompt },
-        {
-          role: "user",
-          content: [
-            {
-              type: "text" as const,
-              text: `Please analyze this plant photo. The crop type is: ${targetCrop}. First look closely at the visible symptoms, then diagnose only from what you can actually see. Respond with JSON only.`,
-            },
-            {
-              type: "image_url" as const,
-              image_url: { url: dataUrl, detail: "high" as const },
-            },
-          ],
-        },
-      ],
-    });
-
-    const raw = response.choices[0]?.message?.content ?? "{}";
     let parsed: Record<string, unknown>;
     try {
-      const jsonMatch = raw.match(/\{[\s\S]*\}/);
-      parsed = JSON.parse(jsonMatch?.[0] ?? raw);
+      parsed = await geminiAnalyzeImage<Record<string, unknown>>({
+        prompt: `${systemPrompt}\n\nPlease analyze this plant photo. The crop type is: ${targetCrop}. First look closely at the visible symptoms, then diagnose only from what you can actually see.`,
+        imageBase64: dataUrl,
+        model: GEMINI_PRO_MODEL,
+        maxOutputTokens: 1600,
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            diseaseName: { type: Type.STRING },
+            scientificName: { type: Type.STRING },
+            affectedCrop: { type: Type.STRING },
+            confidence: { type: Type.STRING, enum: ["high", "medium", "low"] },
+            description: { type: Type.STRING },
+            visibleSymptoms: { type: Type.STRING },
+            differentials: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: { name: { type: Type.STRING }, note: { type: Type.STRING } },
+                required: ["name", "note"],
+              },
+            },
+            immediateSteps: { type: Type.ARRAY, items: { type: Type.STRING } },
+            doNotDo: { type: Type.ARRAY, items: { type: Type.STRING } },
+            treatmentSteps: { type: Type.ARRAY, items: { type: Type.STRING } },
+            preventionTips: { type: Type.ARRAY, items: { type: Type.STRING } },
+            urgency: { type: Type.STRING, enum: ["immediate", "within-3-days", "within-week", "monitor"] },
+            recommendedProduct: { type: Type.STRING },
+            isDisease: { type: Type.BOOLEAN },
+          },
+          required: [
+            "diseaseName", "scientificName", "affectedCrop", "confidence", "description",
+            "visibleSymptoms", "differentials", "immediateSteps", "doNotDo", "treatmentSteps",
+            "preventionTips", "urgency", "recommendedProduct", "isDisease",
+          ],
+        },
+      });
     } catch {
-      // Honesty over a guess: if we cannot parse a clean diagnosis, do NOT present
+      // Honesty over a guess: if we cannot get a clean diagnosis, do NOT present
       // a confident-looking result. Ask for a clearer photo / KVK instead.
       parsed = {
         diseaseName: "Unable to identify — please take a clearer, closer photo of the affected part in good light",
@@ -394,44 +390,23 @@ router.post("/ai/count-workers", requireActiveSubscription, requireWalletCredit(
   const { imageBase64 } = req.body as { imageBase64: string };
   if (!imageBase64) { res.status(400).json({ error: "imageBase64 is required" }); return; }
 
-  const dataUrl = imageBase64.startsWith("data:") ? imageBase64 : `data:image/jpeg;base64,${imageBase64}`;
-
   try {
-    const response = await openai.chat.completions.create({
-      model: "gpt-5.4",
-      max_completion_tokens: 256,
-      messages: [
-        {
-          role: "system",
-          content: `You are an AI assistant that counts the number of people (farm workers) visible in a photo.
+    const parsed = await geminiAnalyzeImage<{ count: number; confidence: string; notes: string }>({
+      prompt: `Count the number of people (farm workers) visible in this photo.
 Count every person whose head or body is clearly visible — include people in the background if you can see them.
-Respond with pure JSON only (no markdown), with exactly these fields:
-{
-  "count": <integer — total number of people you can see>,
-  "confidence": "high" | "medium" | "low",
-  "notes": "<one short sentence describing what you see, e.g. '8 workers standing in a row in a field'>"
-}
 If no people are visible, return count: 0.
 If the image is too blurry or unclear, return count: 0 and confidence: "low".`,
+      imageBase64,
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          count: { type: Type.INTEGER, description: "Total number of people visible" },
+          confidence: { type: Type.STRING, enum: ["high", "medium", "low"] },
+          notes: { type: Type.STRING, description: "One short sentence describing what you see" },
         },
-        {
-          role: "user",
-          content: [
-            { type: "text" as const, text: "Count all the farm workers visible in this photo. Return JSON only." },
-            { type: "image_url" as const, image_url: { url: dataUrl, detail: "auto" as const } },
-          ],
-        },
-      ],
+        required: ["count", "confidence", "notes"],
+      },
     });
-
-    const raw = response.choices[0]?.message?.content ?? "{}";
-    let parsed: { count: number; confidence: string; notes: string };
-    try {
-      const jsonMatch = raw.match(/\{[\s\S]*\}/);
-      parsed = JSON.parse(jsonMatch?.[0] ?? raw);
-    } catch {
-      parsed = { count: 0, confidence: "low", notes: "Could not parse AI response. Please try again." };
-    }
 
     await chargeAISafe(effectiveOwnerId(req)!, "count_workers");
     res.json({ count: Math.max(0, Math.round(Number(parsed.count) || 0)), confidence: parsed.confidence ?? "low", notes: parsed.notes ?? "" });
@@ -485,33 +460,51 @@ Respond with pure JSON only (no markdown, no explanation outside the JSON):
   "notes": "string — any other relevant information visible on the page (names, farm details, etc.)"
 }
 
-If the image is not an account book or is too unclear to read at all, return:
-{ "error": "Cannot read this image clearly. Please take a closer photo in good daylight with the book lying flat." }
+If the image is not an account book or is too unclear to read at all, set "error" to a message like:
+"Cannot read this image clearly. Please take a closer photo in good daylight with the book lying flat." — and leave entries as an empty array.
 
 Be thorough — read every line. NEVER silently guess when something is unclear. If an amount, word, or date is hard to read: still include the entry with your best estimate, mark confidence "low", and add a "question" asking the farmer to confirm (they wrote the book — they can rectify it). Only skip an entry if it is completely invisible.`;
 
   try {
-    const response = await openai.chat.completions.create({
-      model: "gpt-5.4",
-      max_completion_tokens: 2500,
-      messages: [
-        { role: "system", content: systemPrompt },
-        {
-          role: "user",
-          content: [
-            { type: "text" as const, text: "Please read all entries from this farm account book page and return the structured JSON only." },
-            { type: "image_url" as const, image_url: { url: dataUrl, detail: "high" as const } },
-          ],
-        },
-      ],
-    });
-
-    const raw = response.choices[0]?.message?.content ?? "{}";
     let parsed: Record<string, unknown>;
     let parseFailed = false;
     try {
-      const jsonMatch = raw.match(/\{[\s\S]*\}/);
-      parsed = JSON.parse(jsonMatch?.[0] ?? raw);
+      parsed = await geminiAnalyzeImage<Record<string, unknown>>({
+        prompt: `${systemPrompt}\n\nPlease read all entries from this farm account book page.`,
+        imageBase64: dataUrl,
+        model: GEMINI_PRO_MODEL,
+        maxOutputTokens: 2500,
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            error: { type: Type.STRING, description: "Set only when the image can't be read at all" },
+            year: { type: Type.STRING },
+            pageDescription: { type: Type.STRING },
+            entries: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  type: { type: Type.STRING, enum: ["expense", "income"] },
+                  category: { type: Type.STRING, enum: ["Labour", "Fertilizer", "Pesticide", "Seed", "Harvest", "Equipment", "Other"] },
+                  description: { type: Type.STRING },
+                  originalText: { type: Type.STRING },
+                  amount: { type: Type.NUMBER },
+                  date: { type: Type.STRING },
+                  unit: { type: Type.STRING },
+                  confidence: { type: Type.STRING, enum: ["high", "medium", "low"] },
+                  question: { type: Type.STRING },
+                },
+                required: ["type", "category", "description", "originalText", "amount", "confidence"],
+              },
+            },
+            totalExpense: { type: Type.NUMBER },
+            totalIncome: { type: Type.NUMBER },
+            notes: { type: Type.STRING },
+          },
+          required: ["entries", "totalExpense", "totalIncome"],
+        },
+      });
     } catch {
       parsed = { error: "Could not read entries. Please take a clearer photo in good light and try again." };
       parseFailed = true;

@@ -12,6 +12,7 @@
     "db:push-force": "drizzle-kit push --force --config ./src/db/drizzle.config.ts"
   },
   "dependencies": {
+    "@google/genai": "^2.18.0",
     "compression": "^1.8.1",
     "cors": "^2.8.6",
     "drizzle-orm": "^0.45.2",

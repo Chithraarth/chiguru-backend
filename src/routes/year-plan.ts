@@ -3,7 +3,7 @@ import { Router } from "express";
 import { db } from "../db";
 import { planTasksTable, farmProfileTable, cropsTable } from "../db/schema";
 import { eq, and, asc } from "drizzle-orm";
-import { openai } from "../integrations-openai-ai-server";
+import { geminiGenerateJson, Type } from "../integrations-gemini-ai-server";
 import { requireActiveSubscription } from "../middlewares/subscriptionGate";
 import { effectiveOwnerId } from "../middlewares/firebaseAuth";
 import { ensureAICredit, chargeAISafe } from "../lib/wallet";
@@ -201,20 +201,30 @@ Rules:
 Respond ONLY with JSON: {"tasks":[{"cropId":1,"month":"2026-08","day":10,"title":"...","details":"...","category":"fertilizer"}, ...]}`;
 
   try {
-    const completion = await openai.chat.completions.create({
-      model: "gpt-5.1",
-      max_completion_tokens: 8192,
-      messages: [{ role: "user", content: prompt }],
-      response_format: { type: "json_object" },
+    const parsed = await geminiGenerateJson<{ tasks?: unknown }>({
+      prompt,
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          tasks: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                cropId: { type: Type.INTEGER, nullable: true },
+                month: { type: Type.STRING },
+                day: { type: Type.INTEGER, nullable: true },
+                title: { type: Type.STRING },
+                details: { type: Type.STRING },
+                category: { type: Type.STRING, enum: CATEGORIES },
+              },
+              required: ["month", "title", "category"],
+            },
+          },
+        },
+        required: ["tasks"],
+      },
     });
-    const raw = completion.choices[0]?.message?.content ?? "{}";
-    let parsed: { tasks?: unknown };
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      const m = raw.match(/\{[\s\S]*\}/);
-      parsed = m ? JSON.parse(m[0]) : {};
-    }
     const cropIds = new Set(crops.map((c) => c.id));
     const tasks = (Array.isArray(parsed.tasks) ? parsed.tasks : [])
       .filter((t: any) =>
