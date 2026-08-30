@@ -1665,26 +1665,47 @@ router.post("/work-groups/:id/season-end", async (req, res) => {
     .from(groupAdvancePaymentsTable)
     .where(eq(groupAdvancePaymentsTable.workGroupId, groupId));
 
-  const workerMap = new Map<number, { name: string; days: number; earned: number }>();
+  // Direct payments to a SPECIFIC worker (e.g. via the Labour Records / Pay
+  // Sheet screen) - unlike groupAdvancePaymentsTable above, these are
+  // attributable to one person, so they must reduce that worker's own
+  // balance, not get smeared evenly across the whole group.
+  const workerPayments = await db.select()
+    .from(workerPaymentsTable)
+    .where(eq(workerPaymentsTable.workGroupId, groupId));
+
+  const workerMap = new Map<number, { name: string; days: number; earned: number; paidDirect: number }>();
   for (const att of allAttendance) {
     if (!workerMap.has(att.workerId)) {
-      workerMap.set(att.workerId, { name: att.workerName ?? "Unknown", days: 0, earned: 0 });
+      workerMap.set(att.workerId, { name: att.workerName ?? "Unknown", days: 0, earned: 0, paidDirect: 0 });
     }
     const w = workerMap.get(att.workerId)!;
     w.days += 1;
     w.earned += Number(att.wageAmount);
   }
+  for (const p of workerPayments) {
+    if (p.workerId == null) continue;
+    const w = workerMap.get(p.workerId);
+    if (w) w.paidDirect += Number(p.amount);
+  }
 
   const totalAdvancePaid = payments.reduce((s, p) => s + Number(p.totalAdvancePaid), 0);
+  const totalWorkerPayments = workerPayments.reduce((s, p) => s + Number(p.amount), 0);
   const totalEarned = [...workerMap.values()].reduce((s, w) => s + w.earned, 0);
-  const totalRemaining = totalEarned - totalAdvancePaid;
+  const totalRemaining = totalEarned - totalAdvancePaid - totalWorkerPayments;
   const workerCount = workerMap.size || 1;
 
+  // The group-level advance (no worker attribution) is split evenly as an
+  // estimate; direct worker payments are exact, since they're tied to one
+  // person. A worker's balance combines both.
+  const unattributedAdvancePerWorker = totalAdvancePaid / workerCount;
   const workerLines = [...workerMap.values()]
-    .map(w => `  - ${w.name}: ${w.days} days worked, ₹${w.earned.toLocaleString("en-IN")} earned, approx ₹${Math.round(totalAdvancePaid / workerCount).toLocaleString("en-IN")} advance paid, balance ₹${Math.round(w.earned - totalAdvancePaid / workerCount).toLocaleString("en-IN")}`).join("\n");
+    .map(w => `  - ${w.name}: ${w.days} days worked, ₹${w.earned.toLocaleString("en-IN")} earned, ₹${Math.round(w.paidDirect).toLocaleString("en-IN")} paid directly, approx ₹${Math.round(unattributedAdvancePerWorker).toLocaleString("en-IN")} share of group advance, balance ₹${Math.round(w.earned - w.paidDirect - unattributedAdvancePerWorker).toLocaleString("en-IN")}`).join("\n");
   const paymentLines = payments
     .map(p => `  - ${p.periodLabel} (${p.paymentDate}): ${p.workerCount} workers × ${p.daysCount} days × ₹${p.advancePerWorkerPerDay}/day = ₹${Number(p.totalAdvancePaid).toLocaleString("en-IN")}`)
-    .join("\n") || "  No advance payments recorded.";
+    .join("\n") || "  No group advance payments recorded.";
+  const directPaymentLines = workerPayments
+    .map(p => `  - ${workerMap.get(p.workerId ?? -1)?.name ?? "Unknown"}: ₹${Number(p.amount).toLocaleString("en-IN")} (${p.paymentDate})`)
+    .join("\n") || "  No direct worker payments recorded.";
 
   const prompt = `You are an agricultural estate accountant helping an Indian farmer do final season settlement.
 
@@ -1697,12 +1718,16 @@ Payment frequency: ${group.payFrequency}
 Worker Summary:
 ${workerLines || "  No attendance recorded."}
 
-Advance Payments Made:
+Group Advance Payments Made (not tied to one worker):
 ${paymentLines}
+
+Direct Payments to Individual Workers:
+${directPaymentLines}
 
 Totals:
   Total wages earned: ₹${totalEarned.toLocaleString("en-IN")}
-  Total advance paid: ₹${totalAdvancePaid.toLocaleString("en-IN")}
+  Total group advance paid: ₹${totalAdvancePaid.toLocaleString("en-IN")}
+  Total paid directly to workers: ₹${totalWorkerPayments.toLocaleString("en-IN")}
   Net remaining to pay: ₹${totalRemaining.toLocaleString("en-IN")}
 
 Write a clear final season account in simple Hindi-English (Hinglish) language suitable for an Indian farm owner. Include:
@@ -1725,7 +1750,7 @@ Keep it short, practical, and formatted with clear sections.`;
 
   return res.json({
     aiSummary,
-    totals: { totalEarned, totalAdvancePaid, totalRemaining },
+    totals: { totalEarned, totalAdvancePaid, totalWorkerPayments, totalRemaining },
     workerCount,
   });
 });
