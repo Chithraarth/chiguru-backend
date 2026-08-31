@@ -739,7 +739,7 @@ router.get("/workers", async (req, res) => {
 
 router.post("/workers", async (req, res) => {
   const eid = await activeEstateId(req);
-  const { estateId: _ignore, ...body } = req.body ?? {};
+  const { estateId: _ignore, clientId, ...body } = req.body ?? {};
   // Quick-add flows (e.g. "type new worker" in loan/attendance forms) send only
   // a name — fill the DB-required fields with sensible defaults.
   const values = {
@@ -747,7 +747,28 @@ router.post("/workers", async (req, res) => {
     wageRate: "0",
     ...body,
     estateId: eid,
+    clientId: typeof clientId === "string" && clientId.trim() !== "" ? clientId : null,
   };
+
+  // Idempotent replay: a flaky network can drop the response after the row
+  // was committed; a retried quick-add (offline queue, or a double-tap) then
+  // re-sends the same clientId. Never insert a duplicate worker.
+  if (values.clientId) {
+    const [inserted] = await db.insert(workersTable).values(values)
+      .onConflictDoNothing({ target: workersTable.clientId })
+      .returning();
+    if (inserted) return res.status(201).json(inserted);
+    const [existing] = await db.select().from(workersTable)
+      .where(
+        eid != null
+          ? and(eq(workersTable.clientId, values.clientId), eq(workersTable.estateId, eid))
+          : eq(workersTable.clientId, values.clientId)
+      )
+      .limit(1);
+    if (!existing) return res.status(404).json({ message: "Not found" });
+    return res.status(200).json(existing);
+  }
+
   const [row] = await db.insert(workersTable).values(values).returning();
   return res.status(201).json(row);
 });
@@ -1651,6 +1672,19 @@ router.post("/work-groups/:id/season-end", async (req, res) => {
       ),
     );
   if (!group) return res.status(404).json({ error: "Group not found" });
+
+  // Idempotent replay guard: a retried request (dropped response, or a
+  // double-tap before the button's own disabled state commits) must not
+  // re-run the AI call and silently regenerate a different summary over an
+  // already-closed season. Once closed, just hand back what was saved.
+  if (group.seasonClosed) {
+    return res.json({
+      aiSummary: group.seasonSummary ?? "",
+      totals: null,
+      workerCount: null,
+      alreadyClosed: true,
+    });
+  }
 
   const allAttendance = await db.select({
     workerId: attendanceTable.workerId,

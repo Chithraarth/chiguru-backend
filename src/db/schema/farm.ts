@@ -116,7 +116,13 @@ export const workersTable = pgTable("workers", {
   // Payee handle for direct payments (e.g. UPI ID in India, wallet/phone elsewhere).
   upiId: text("upi_id"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
-});
+  // Idempotency key for the quick-add ("type a new name") flows in the
+  // loan/attendance forms - a retried POST (e.g. after a network blip)
+  // returns the already-created worker instead of making a duplicate.
+  clientId: text("client_id"),
+}, (t) => ({
+  clientIdUnique: uniqueIndex("workers_client_id_unique").on(t.clientId),
+}));
 
 export const workGroupsTable = pgTable("work_groups", {
   id: serial("id").primaryKey(),
