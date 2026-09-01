@@ -819,6 +819,64 @@ router.delete("/workers/:id", async (req, res) => {
   return res.status(204).end();
 });
 
+// Single-person face attendance: the owner photographs one worker's face and
+// this compares it against every active worker's saved reference photo
+// (Worker.photoUrl) using Gemini vision, mirroring the "photo in, AI answer
+// out" shape of /ai/count-workers rather than any on-device face model.
+router.post("/workers/face-match", async (req, res) => {
+  const { imageBase64 } = req.body as { imageBase64?: string };
+  if (!imageBase64) return res.status(400).json({ error: "imageBase64 is required" });
+
+  const eid = await activeEstateId(req);
+  const candidates = await db
+    .select({ id: workersTable.id, name: workersTable.name, photoUrl: workersTable.photoUrl })
+    .from(workersTable)
+    .where(
+      and(
+        eq(workersTable.isActive, true),
+        isNotNull(workersTable.photoUrl),
+        eid != null ? eq(workersTable.estateId, eid) : undefined,
+      ),
+    );
+
+  if (candidates.length === 0) {
+    return res.json({ matchedWorkerId: null, confidence: "low", message: "No workers have a reference photo saved yet." });
+  }
+
+  try {
+    const { geminiAnalyzeImage, Type } = await import("../integrations-gemini-ai-server");
+    const result = await geminiAnalyzeImage<{ matchedLabel: string | null; confidence: string }>({
+      prompt: `The first photo is of a farm worker taken just now to mark attendance. The photos after it are reference photos of known workers, each preceded by a text label naming which worker it is.
+Decide whether the first photo shows the SAME PERSON as any one of the labeled reference photos.
+If it clearly matches one of them, return that photo's exact label in matchedLabel.
+If it does not clearly match any of them, or you are not confident, return matchedLabel: null.
+Be conservative — only report a match when you are genuinely confident it is the same person, since a wrong match marks the wrong worker present.`,
+      imageBase64,
+      extraImages: candidates.map((c) => ({ label: `worker-${c.id}`, imageBase64: c.photoUrl! })),
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          matchedLabel: { type: Type.STRING, nullable: true, description: "e.g. \"worker-12\", or null if no confident match" },
+          confidence: { type: Type.STRING, enum: ["high", "medium", "low"] },
+        },
+        required: ["confidence"],
+      },
+      maxOutputTokens: 2048,
+    });
+
+    const matchedId = result.matchedLabel ? Number(result.matchedLabel.replace("worker-", "")) : null;
+    const matched = matchedId != null ? candidates.find((c) => c.id === matchedId) : null;
+    return res.json({
+      matchedWorkerId: matched?.id ?? null,
+      matchedWorkerName: matched?.name ?? null,
+      confidence: result.confidence ?? "low",
+    });
+  } catch (err) {
+    console.error("face-match error:", err);
+    return res.status(500).json({ error: "AI face match failed. Please try again." });
+  }
+});
+
 router.get("/workers/:id/wages", async (req, res) => {
   const workerId = Number(req.params.id);
   const month = (req.query.month as string) ?? new Date().toISOString().slice(0, 7);

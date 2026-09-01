@@ -135,19 +135,28 @@ export async function geminiAnalyzeImage<T>(opts: {
   responseSchema: Schema;
   model?: string;
   maxOutputTokens?: number;
+  // Extra labeled images alongside the primary one (e.g. each candidate
+  // worker's reference photo, for face-match comparison) — each is
+  // introduced by its own text label so the prompt can refer back to it
+  // ("photo labeled worker-12") when asking Gemini to pick a match.
+  extraImages?: { label: string; imageBase64: string }[];
 }): Promise<T> {
   const match = opts.imageBase64.match(/^data:(.+?);base64,(.+)$/);
   const mimeType = match?.[1] ?? "image/jpeg";
   const data = match?.[2] ?? opts.imageBase64;
 
+  const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [
+    { text: opts.prompt },
+    { inlineData: { mimeType, data } },
+  ];
+  for (const extra of opts.extraImages ?? []) {
+    parts.push({ text: extra.label });
+    parts.push({ inlineData: dataUrlToInlineData(extra.imageBase64) });
+  }
+
   const response = await gemini.models.generateContent({
     model: opts.model ?? GEMINI_PRO_MODEL,
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: opts.prompt }, { inlineData: { mimeType, data } }],
-      },
-    ],
+    contents: [{ role: "user", parts }],
     config: {
       responseMimeType: "application/json",
       responseSchema: opts.responseSchema,
