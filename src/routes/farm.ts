@@ -1101,10 +1101,25 @@ router.get("/work-groups", async (req, res) => {
     .from(attendanceTable)
     .groupBy(attendanceTable.workGroupId);
 
+  // Same aggregate, scoped to today only - the group-list card shows this
+  // (not the lifetime totalCostToDate below) so "Total" next to "₹X per
+  // day" doesn't read as if it's yesterday's cost carrying over.
+  const today = new Date().toISOString().slice(0, 10);
+  const todayCostRows = await db
+    .select({
+      workGroupId: attendanceTable.workGroupId,
+      total: sql<string>`coalesce(sum(wage_amount),0)`,
+    })
+    .from(attendanceTable)
+    .where(eq(attendanceTable.date, today))
+    .groupBy(attendanceTable.workGroupId);
+
   const costMap = new Map(costRows.map((c) => [c.workGroupId, Number(c.total)]));
+  const todayCostMap = new Map(todayCostRows.map((c) => [c.workGroupId, Number(c.total)]));
   const withCosts = rows.map((wg) => ({
     ...wg,
     totalCostToDate: costMap.get(wg.id) ?? 0,
+    todayCost: todayCostMap.get(wg.id) ?? 0,
   }));
 
   return res.json(withCosts);
