@@ -16,11 +16,15 @@ export const razorpay = new Razorpay({
 export const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID;
 
 // A monthly plan billed "until cancelled" still needs a total_count in
-// Razorpay's model — 100 years' worth of monthly cycles is the accepted way
-// to express "recurs indefinitely" since Razorpay has no true "forever" value.
+// Razorpay's model, since it has no true "forever" value — Razorpay's own
+// checkout displays this as "charges every month until <the resulting end
+// date>", so a very large count (e.g. 100 years) reads as alarming to a real
+// subscriber even though it's harmless (they can cancel anytime well before
+// then). Capped at a few years instead — long enough nobody realistically
+// hits the limit, short enough the checkout's own date doesn't look wrong.
 const TOTAL_COUNT_BY_PERIOD: Record<string, number> = {
-  monthly: 1200,
-  yearly: 100,
+  monthly: 48, // 4 years
+  yearly: 4,
 };
 
 /**
