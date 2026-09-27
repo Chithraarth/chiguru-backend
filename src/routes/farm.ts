@@ -392,6 +392,33 @@ router.delete("/me/devices/:id", requireOwner, async (req, res) => {
   return res.status(204).send();
 });
 
+// Every estate this signed-in person may act on, across BOTH relationships at
+// once — their own estate(s) if they're an Owner, AND every estate belonging
+// to each Owner who has an active invite for them. This is the "Choose
+// Estate" screen's one call: it runs before any X-Estate-Id is chosen, so it
+// can't use effectiveOwnerId (which needs that header to disambiguate) —
+// instead it lists everything req.owner/req.managers already resolved to.
+router.get("/me/estates", requireOwnerOrManager, async (req, res) => {
+  const ownerIds = new Set<number>();
+  if (req.owner) ownerIds.add(req.owner.id);
+  for (const m of req.managers) ownerIds.add(m.ownerId);
+
+  const rows =
+    ownerIds.size > 0
+      ? await db
+          .select()
+          .from(farmProfileTable)
+          .where(inArray(farmProfileTable.ownerId, [...ownerIds]))
+          .orderBy(farmProfileTable.id)
+      : [];
+
+  const estates = rows.map((estate) => ({
+    ...estate,
+    relationship: req.owner?.id === estate.ownerId ? ("own" as const) : ("invited" as const),
+  }));
+  return res.json(estates);
+});
+
 // List the Owner's estates (newest first), so the switcher can show them —
 // a signed-in Manager can list them too, scoped to the Owner they work for.
 router.get("/estates", requireOwnerOrManager, async (req, res) => {
