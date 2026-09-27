@@ -25,7 +25,7 @@ import { logger } from "../lib/logger";
 // One-time price for a permanent +1 manager seat add-on — never expires,
 // unlike a subscription. Fixed (not user-entered) since this buys exactly
 // one seat.
-const MANAGER_SEAT_ADDON_PRICE = 199;
+const MANAGER_SEAT_ADDON_PRICE = 99;
 
 const router: IRouter = Router();
 

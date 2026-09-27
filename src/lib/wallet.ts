@@ -17,7 +17,7 @@ import { db, walletBalancesTable, walletTransactionsTable } from "../db";
  */
 
 /** Owner picks any amount to recharge — this is just a floor, not a fixed list. */
-export const MIN_RECHARGE_AMOUNT = 199;
+export const MIN_RECHARGE_AMOUNT = 200;
 /** Share the app on 3 different social platforms → one-time wallet credit. */
 export const SHARE_REWARD = 300;
 export const SHARE_TARGET = 3;
