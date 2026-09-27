@@ -4,7 +4,7 @@ import { db, managersTable, farmProfileTable } from "../db";
 import { requireOwner } from "../middlewares/firebaseAuth";
 import { firebaseAuth } from "../lib/firebase-admin";
 import { logger } from "../lib/logger";
-import { canCreateManager } from "../services/entitlement.service";
+import { canCreateManager, isSubscriptionActive } from "../services/entitlement.service";
 import { sendInviteEmail } from "../lib/invite-email";
 
 const router: IRouter = Router();
@@ -50,10 +50,12 @@ router.post("/managers", requireOwner, async (req, res) => {
   }
 
   if (!(await canCreateManager(req.owner!.id))) {
-    res.status(403).json({
-      message: "Your current subscription does not have enough Manager seats.",
-      code: "NO_SEATS_AVAILABLE",
-    });
+    const subscribed = await isSubscriptionActive(req.owner!.id);
+    res.status(403).json(
+      subscribed
+        ? { message: "You've used all your invitee seats. Buy another seat to invite more people.", code: "NO_SEATS_AVAILABLE" }
+        : { message: "An active subscription is required to invite someone to your farm.", code: "SUBSCRIPTION_REQUIRED" },
+    );
     return;
   }
 
