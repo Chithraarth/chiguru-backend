@@ -18,9 +18,6 @@ import { db, walletBalancesTable, walletTransactionsTable } from "../db";
 
 /** Owner picks any amount to recharge — this is just a floor, not a fixed list. */
 export const MIN_RECHARGE_AMOUNT = 200;
-/** Share the app on 3 different social platforms → one-time wallet credit. */
-export const SHARE_REWARD = 300;
-export const SHARE_TARGET = 3;
 
 /** Server-side accounting only — never expose. */
 const AI_COST_RATIO = 0.7;
@@ -59,8 +56,6 @@ export async function getWalletState(ownerId: number) {
   const row = await getOrCreateBalanceRow(ownerId);
   return {
     balance: Number(row.balance || 0),
-    sharePlatforms: (row.sharePlatforms ?? "").split(",").filter(Boolean),
-    shareRewardClaimedAt: row.shareRewardClaimedAt,
   };
 }
 
@@ -199,51 +194,6 @@ export async function creditWallet(opts: {
       clientId: opts.clientId,
     });
     return { balance: newBalance, duplicate: false };
-  });
-}
-
-/** Share-to-earn: mark a platform shared, credit once the target is reached. */
-export async function recordShare(ownerId: number, platform: string): Promise<{
-  platforms: string[];
-  rewarded: boolean;
-  creditGiven: boolean;
-  balance: number;
-}> {
-  return db.transaction(async (tx) => {
-    let [row] = await tx
-      .select()
-      .from(walletBalancesTable)
-      .where(eq(walletBalancesTable.ownerId, ownerId))
-      .limit(1)
-      .for("update");
-    if (!row) [row] = await tx.insert(walletBalancesTable).values({ ownerId }).returning();
-
-    const set = new Set((row.sharePlatforms ?? "").split(",").filter(Boolean));
-    set.add(platform);
-    const platforms = [...set];
-    let rewarded = row.shareRewardClaimedAt != null;
-    let creditGiven = false;
-    let balance = Number(row.balance || 0);
-
-    if (!rewarded && set.size >= SHARE_TARGET) {
-      balance = Math.round((balance + SHARE_REWARD) * 100) / 100;
-      await tx.insert(walletTransactionsTable).values({
-        ownerId,
-        type: "share_reward",
-        amount: String(SHARE_REWARD),
-        clientId: `share-reward-${ownerId}`,
-      });
-      rewarded = true;
-      creditGiven = true;
-    }
-
-    await tx.update(walletBalancesTable).set({
-      sharePlatforms: platforms.join(","),
-      updatedAt: new Date(),
-      ...(creditGiven ? { shareRewardClaimedAt: new Date(), balance: String(balance) } : {}),
-    }).where(eq(walletBalancesTable.id, row.id));
-
-    return { platforms, rewarded, creditGiven, balance };
   });
 }
 

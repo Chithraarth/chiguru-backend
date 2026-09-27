@@ -20,8 +20,6 @@ export const walletBalancesTable = pgTable("wallet_balances", {
   id: serial("id").primaryKey(),
   ownerId: integer("owner_id").notNull().references(() => ownersTable.id).unique(),
   balance: numeric("balance", { precision: 10, scale: 2 }).notNull().default("0"),
-  sharePlatforms: text("share_platforms").notNull().default(""), // comma-separated, e.g. "whatsapp,facebook"
-  shareRewardClaimedAt: timestamp("share_reward_claimed_at"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
@@ -33,7 +31,7 @@ export type WalletBalance = typeof walletBalancesTable.$inferSelect;
 export const walletTransactionsTable = pgTable("wallet_transactions", {
   id: serial("id").primaryKey(),
   ownerId: integer("owner_id").notNull().references(() => ownersTable.id),
-  type: text("type").notNull(), // "recharge" | "ai_charge" | "share_reward"
+  type: text("type").notNull(), // "recharge" | "ai_charge" (older rows may also say "share_reward", from a since-removed feature)
   feature: text("feature"), // set only for ai_charge, e.g. "disease_check"
   amount: numeric("amount", { precision: 10, scale: 2 }).notNull(), // positive=credit, negative=debit
   aiCost: numeric("ai_cost", { precision: 10, scale: 2 }),

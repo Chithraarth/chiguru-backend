@@ -1,6 +1,6 @@
 import { Router, type IRouter } from "express";
 import { requireOwner } from "../middlewares/firebaseAuth";
-import { MIN_RECHARGE_AMOUNT, SHARE_TARGET, AI_PRICES, getWalletState, getWalletHistory, creditWallet, recordShare } from "../lib/wallet";
+import { MIN_RECHARGE_AMOUNT, AI_PRICES, getWalletState, getWalletHistory, creditWallet } from "../lib/wallet";
 import { createOneTimeOrder, verifyOrderPaymentSignature, RAZORPAY_KEY_ID } from "../lib/razorpay";
 
 const router: IRouter = Router();
@@ -19,12 +19,6 @@ router.get("/wallet", requireOwner, async (req, res) => {
     balance: state.balance,
     minRechargeAmount: MIN_RECHARGE_AMOUNT,
     aiPrices: Object.fromEntries(Object.entries(AI_PRICES).map(([k, v]) => [k, { price: v.price, label: v.label }])),
-    share: {
-      target: SHARE_TARGET,
-      reward: 300,
-      platforms: state.sharePlatforms,
-      rewarded: state.shareRewardClaimedAt != null,
-    },
     ...history,
   });
 });
@@ -63,19 +57,6 @@ router.post("/wallet/recharge/verify", requireOwner, async (req, res) => {
     clientId: paymentId, // Razorpay's payment id is already globally unique — a retried verify call can never double-credit.
   });
   res.json({ ok: true, balance: result.balance, duplicate: result.duplicate });
-});
-
-/** Share-to-earn: 3 different platforms → one-time ₹300 wallet credit. */
-router.post("/wallet/share", requireOwner, async (req, res) => {
-  const { platform } = req.body as { platform?: string };
-  const allowed = ["whatsapp", "facebook", "instagram", "x", "telegram"];
-  const p = String(platform ?? "").toLowerCase();
-  if (!allowed.includes(p)) {
-    res.status(400).json({ message: `platform must be one of: ${allowed.join(", ")}`, code: "INVALID_PLATFORM" });
-    return;
-  }
-  const result = await recordShare(req.owner!.id, p);
-  res.json(result);
 });
 
 export default router;
