@@ -26,6 +26,14 @@ declare global {
        * own doc comment for the resolution order.
        */
       resolvedOwnerId: number | null;
+      /**
+       * The verified Firebase token's own identity fields, whenever a valid
+       * token was presented — set regardless of whether it resolved to an
+       * Owner/invitee yet. Used by routes/invites.ts to find pending invites
+       * that match THIS person's phone/email, since a not-yet-accepted
+       * invite has no firebaseUid to look it up by.
+       */
+      firebaseIdentity?: { uid: string; phone: string | null; email: string | null };
     }
   }
 }
@@ -52,30 +60,16 @@ export async function firebaseAuthMiddleware(req: Request, _res: Response, next:
 
   try {
     const decoded = await firebaseAuth.verifyIdToken(token);
+    req.firebaseIdentity = {
+      uid: decoded.uid,
+      phone: decoded.phone_number ?? null,
+      email: decoded.email ?? null,
+    };
 
     const [existing] = await db
       .select()
       .from(ownersTable)
       .where(eq(ownersTable.firebaseUid, decoded.uid));
-
-    // Claim every still-pending invite that matches this login's phone or
-    // email — a person may have been invited by several Owners before their
-    // first sign-in, and all of them should activate together, not just one.
-    const matchConditions = [];
-    if (decoded.phone_number) matchConditions.push(eq(managersTable.phone, decoded.phone_number));
-    if (decoded.email) matchConditions.push(eq(managersTable.email, decoded.email));
-    if (matchConditions.length > 0) {
-      const pendingInvites = await db
-        .select()
-        .from(managersTable)
-        .where(and(or(...matchConditions), eq(managersTable.status, "pending")));
-      for (const invite of pendingInvites) {
-        await db
-          .update(managersTable)
-          .set({ firebaseUid: decoded.uid, status: "active", activatedAt: new Date() })
-          .where(eq(managersTable.id, invite.id));
-      }
-    }
 
     req.managers = await db
       .select()

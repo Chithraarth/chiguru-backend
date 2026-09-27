@@ -97,6 +97,7 @@ router.post("/managers", requireOwner, async (req, res) => {
       toEmail: trimmedEmail,
       inviteeName: trimmedName,
       ownerName: req.owner!.fullName,
+      ownerEmail: req.owner!.email,
       farmName: farm?.farmName ?? null,
     }).catch((err) => logger.warn({ err, managerId: created!.id }, "Failed to send invite email"));
   }

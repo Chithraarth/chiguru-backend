@@ -14,15 +14,16 @@ export async function sendInviteEmail(opts: {
   toEmail: string;
   inviteeName: string;
   ownerName: string | null;
+  ownerEmail: string | null;
   farmName: string | null;
 }): Promise<boolean> {
   const subject = `${opts.ownerName ?? "Someone"} invited you to Chiguru`;
   const body = [
     `Hi ${opts.inviteeName},`,
     "",
-    `${opts.ownerName ?? "An owner"} has invited you to help manage ${opts.farmName ? `their farm "${opts.farmName}"` : "their farm"} on Chiguru.`,
+    `${opts.ownerName ?? "An owner"} (${opts.ownerEmail ?? "no email on file"}) has invited you to help manage ${opts.farmName ? `their farm "${opts.farmName}"` : "their farm"} on Chiguru.`,
     "",
-    "Download the Chiguru app and sign in with this email address to get access:",
+    "Open the Chiguru app and sign in with this same email address — you'll see a prompt to accept or decline this invite before it gives you any access.",
     "https://thechiguru.com",
   ].join("\n");
 
@@ -32,7 +33,11 @@ export async function sendInviteEmail(opts: {
   }
 
   // TODO: replace with an actual AWS SES SendEmailCommand once credentials
-  // are provisioned for this project.
-  logger.warn({ to: opts.toEmail }, "MAIL_ENABLED is true but SES sending is not yet implemented");
+  // are provisioned for this project. Sent from a system address (MAIL_FROM),
+  // never the Owner's own address — SES can't send arbitrary "From" domains
+  // without each Owner individually verifying their address, so the Owner is
+  // named in the subject/body instead, with reply-to set to their address so
+  // a reply still reaches them directly.
+  logger.warn({ to: opts.toEmail, replyTo: opts.ownerEmail }, "MAIL_ENABLED is true but SES sending is not yet implemented");
   return false;
 }
