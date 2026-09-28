@@ -27,11 +27,35 @@ declare global {
        */
       resolvedOwnerId: number | null;
       /**
+       * How this request acts on resolvedOwnerId's data: "owner" when it's
+       * the person's own estate, "invitee" when it's through an invite (see
+       * middlewares/inviteeAccess.ts for what an invitee may do), null when
+       * the request isn't signed in as either.
+       */
+      actorRole: "owner" | "invitee" | null;
+      /**
+       * For an invitee whose invite is scoped to one estate: that estate's id.
+       * resolveActiveEstateId() pins every estate-scoped query to it, so the
+       * invitee can never reach the Owner's other estates. null for owners
+       * and for legacy invites that predate per-estate scoping.
+       */
+      inviteEstateId: number | null;
+      /**
+       * True when the request named an estate (X-Estate-Id) this person may
+       * not act on — a revoked invite, a deleted farm, or someone else's.
+       * Estate data routes then refuse (see inviteeAccess.ts) rather than
+       * silently falling back to another estate, which would e.g. replay a
+       * revoked invitee's queued records onto their own farm.
+       */
+      estateHeaderRejected: boolean;
+      /**
        * The verified Firebase token's own identity fields, whenever a valid
        * token was presented — set regardless of whether it resolved to an
        * Owner/invitee yet. Used by routes/invites.ts to find pending invites
        * that match THIS person's phone/email, since a not-yet-accepted
-       * invite has no firebaseUid to look it up by.
+       * invite has no firebaseUid to look it up by. email is only set when
+       * Firebase has verified it — an unverified email/password account must
+       * never be able to claim an invite addressed to someone else's email.
        */
       firebaseIdentity?: { uid: string; phone: string | null; email: string | null };
     }
@@ -54,6 +78,9 @@ declare global {
 export async function firebaseAuthMiddleware(req: Request, _res: Response, next: NextFunction) {
   req.managers = [];
   req.resolvedOwnerId = null;
+  req.actorRole = null;
+  req.inviteEstateId = null;
+  req.estateHeaderRejected = false;
   const header = req.headers.authorization;
   const token = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : null;
   if (!token) return next();
@@ -63,7 +90,7 @@ export async function firebaseAuthMiddleware(req: Request, _res: Response, next:
     req.firebaseIdentity = {
       uid: decoded.uid,
       phone: decoded.phone_number ?? null,
-      email: decoded.email ?? null,
+      email: decoded.email && decoded.email_verified === true ? decoded.email : null,
     };
 
     const [existing] = await db
@@ -92,9 +119,10 @@ export async function firebaseAuthMiddleware(req: Request, _res: Response, next:
         .returning();
       req.owner = updated;
     } else if (req.managers.length === 0) {
-      // Only auto-create an Owner account for a UID with no Owner row of its
-      // own AND no invite identity either — an invitee's very first sign-in
-      // must never silently create a bogus Owner account.
+      // Everyone signs into the same Owner app, so a first sign-in gets an
+      // Owner account of its own — an invitee may run their own farm too.
+      // Skipped only for legacy invitees who were already active before
+      // they ever signed in here, so they keep acting purely as invitees.
       const [created] = await db
         .insert(ownersTable)
         .values({
@@ -111,7 +139,7 @@ export async function firebaseAuthMiddleware(req: Request, _res: Response, next:
       req.owner = created;
     }
 
-    req.resolvedOwnerId = await resolveOwnerId(req);
+    await resolveAccess(req);
   } catch (err) {
     // Expired/invalid token — treat as signed-out rather than failing the request;
     // requireOwner/requireManager (below) are what actually enforce auth where it matters.
@@ -149,26 +177,18 @@ export function requireOwnerOrManager(req: Request, res: Response, next: NextFun
 }
 
 /**
- * Computes the Owner id a request is scoped to — whether acting as the Owner
- * themselves, or as an invitee on one of the Owner(s) who invited them. Runs
- * once per request, inside firebaseAuthMiddleware, and its result is cached
- * on req.resolvedOwnerId; effectiveOwnerId() below just reads that cache so
- * its many call sites can stay synchronous.
+ * Resolves which Owner's data this request acts on, and in what role — run
+ * once per request inside firebaseAuthMiddleware and cached on the request.
  *
  * Resolution order:
- *  1. X-Estate-Id header, if present: look up which Owner that estate
- *     actually belongs to, then confirm this person may act for that
- *     Owner — either it's their own estate, or one of their active invites
- *     is for that same Owner AND (that invite has no estateId, i.e. it
- *     predates per-estate scoping, or its estateId matches this exact
- *     estate). This is the only path that can disambiguate when a person
- *     holds several invites, or is both an Owner and an invitee.
- *  2. No header, or it didn't resolve to an estate this person may act on:
- *     fall back to the legacy behavior (req.owner if signed in as Owner,
- *     else the sole invite's Owner) — keeps older app builds that never
- *     sent X-Estate-Id for this purpose working unchanged.
+ *  1. X-Estate-Id header, if present: the estate's Owner, when it's this
+ *     person's own estate (role "owner") or they hold an active invite for
+ *     that Owner whose estateId is this exact estate, or null for a legacy
+ *     unscoped invite (role "invitee").
+ *  2. Otherwise: their own Owner account (role "owner"), else their first
+ *     active invite (role "invitee", pinned to that invite's estate).
  */
-async function resolveOwnerId(req: Request): Promise<number | null> {
+async function resolveAccess(req: Request): Promise<void> {
   const header = req.header("X-Estate-Id");
   const estateId = header && !isNaN(Number(header)) ? Number(header) : null;
 
@@ -178,14 +198,65 @@ async function resolveOwnerId(req: Request): Promise<number | null> {
       .from(farmProfileTable)
       .where(eq(farmProfileTable.id, estateId));
     if (estate?.ownerId != null) {
-      const canActForThisOwner =
-        req.owner?.id === estate.ownerId ||
-        req.managers.some((m) => m.ownerId === estate.ownerId && (m.estateId == null || m.estateId === estateId));
-      if (canActForThisOwner) return estate.ownerId;
+      if (req.owner?.id === estate.ownerId) {
+        setAccess(req, estate.ownerId, "owner", null);
+        return;
+      }
+      const invite = req.managers.find(
+        (m) => m.ownerId === estate.ownerId && (m.estateId == null || m.estateId === estateId),
+      );
+      if (invite) {
+        setAccess(req, estate.ownerId, "invitee", invite.estateId);
+        return;
+      }
     }
+    req.estateHeaderRejected = true;
   }
 
-  return req.owner?.id ?? req.managers[0]?.ownerId ?? null;
+  if (req.owner) {
+    setAccess(req, req.owner.id, "owner", null);
+  } else if (req.managers[0]) {
+    setAccess(req, req.managers[0].ownerId, "invitee", req.managers[0].estateId);
+  }
+}
+
+function setAccess(req: Request, ownerId: number, role: "owner" | "invitee", inviteEstateId: number | null) {
+  req.resolvedOwnerId = ownerId;
+  req.actorRole = role;
+  req.inviteEstateId = inviteEstateId;
+}
+
+/**
+ * The estate every estate-scoped query in this request should use:
+ *  - a scoped invitee: always their invite's estate, whatever header was sent;
+ *  - otherwise: the X-Estate-Id header when that estate belongs to the
+ *    resolved Owner, else that Owner's oldest estate.
+ * null when the request isn't signed in or the Owner has no estate yet —
+ * never another Owner's estate.
+ */
+export async function resolveActiveEstateId(req: Request): Promise<number | null> {
+  const ownerId = req.resolvedOwnerId;
+  if (ownerId == null) return null;
+  if (req.actorRole === "invitee" && req.inviteEstateId != null) return req.inviteEstateId;
+
+  const header = req.header("X-Estate-Id");
+  const headerEid = header && !isNaN(Number(header)) ? Number(header) : null;
+  if (headerEid != null) {
+    const [row] = await db
+      .select({ id: farmProfileTable.id })
+      .from(farmProfileTable)
+      .where(and(eq(farmProfileTable.id, headerEid), eq(farmProfileTable.ownerId, ownerId)))
+      .limit(1);
+    if (row) return row.id;
+  }
+
+  const [oldest] = await db
+    .select({ id: farmProfileTable.id })
+    .from(farmProfileTable)
+    .where(eq(farmProfileTable.ownerId, ownerId))
+    .orderBy(farmProfileTable.id)
+    .limit(1);
+  return oldest?.id ?? null;
 }
 
 /** The effective Owner id this request is scoped to — see resolveOwnerId() for how it's computed. */

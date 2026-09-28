@@ -2,34 +2,13 @@ import { Router } from "express";
 import { db } from "../db";
 import { pushDevicesTable, planTasksTable, farmProfileTable } from "../db/schema";
 import { eq, and, ne, isNull, or } from "drizzle-orm";
-import { effectiveOwnerId } from "../middlewares/firebaseAuth";
+import { effectiveOwnerId, resolveActiveEstateId } from "../middlewares/firebaseAuth";
 
 const router = Router();
 
-// Same estate-scoping convention as farm.ts / year-plan.ts.
-async function activeEstateId(
-  req: Parameters<typeof effectiveOwnerId>[0],
-): Promise<number | null> {
-  const ownerId = effectiveOwnerId(req) ?? undefined;
-  const h = req.header("X-Estate-Id");
-  const headerEid = h && !isNaN(Number(h)) ? Number(h) : null;
-
-  if (headerEid != null) {
-    if (!ownerId) return headerEid;
-    const [row] = await db
-      .select({ id: farmProfileTable.id })
-      .from(farmProfileTable)
-      .where(and(eq(farmProfileTable.id, headerEid), eq(farmProfileTable.ownerId, ownerId)))
-      .limit(1);
-    if (row) return row.id;
-  }
-
-  const rows = await db
-    .select({ id: farmProfileTable.id })
-    .from(farmProfileTable)
-    .orderBy(farmProfileTable.id)
-    .limit(1);
-  return rows[0]?.id ?? null;
+// Same estate scoping as farm.ts — see resolveActiveEstateId.
+function activeEstateId(req: Parameters<typeof effectiveOwnerId>[0]): Promise<number | null> {
+  return resolveActiveEstateId(req);
 }
 
 // Validate an IANA timezone name; Intl throws on unknown zones.

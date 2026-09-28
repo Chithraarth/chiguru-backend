@@ -5,7 +5,7 @@ import { planTasksTable, farmProfileTable, cropsTable } from "../db/schema";
 import { eq, and, asc } from "drizzle-orm";
 import { geminiGenerateJson, Type } from "../integrations-gemini-ai-server";
 import { requireActiveSubscription } from "../middlewares/subscriptionGate";
-import { effectiveOwnerId } from "../middlewares/firebaseAuth";
+import { effectiveOwnerId, resolveActiveEstateId } from "../middlewares/firebaseAuth";
 import { ensureAICredit, chargeAISafe } from "../lib/wallet";
 
 const router = Router();
@@ -18,32 +18,9 @@ function requireWalletCredit(feature: string) {
   };
 }
 
-// Same estate-scoping convention as farm.ts: an authenticated request's estate
-// header must belong to that Owner; unauthenticated/legacy calls fall back to
-// the oldest estate when the header is missing.
-async function activeEstateId(
-  req: Parameters<typeof effectiveOwnerId>[0],
-): Promise<number | null> {
-  const ownerId = effectiveOwnerId(req) ?? undefined;
-  const h = req.header("X-Estate-Id");
-  const headerEid = h && !isNaN(Number(h)) ? Number(h) : null;
-
-  if (headerEid != null) {
-    if (!ownerId) return headerEid;
-    const [row] = await db
-      .select({ id: farmProfileTable.id })
-      .from(farmProfileTable)
-      .where(and(eq(farmProfileTable.id, headerEid), eq(farmProfileTable.ownerId, ownerId)))
-      .limit(1);
-    if (row) return row.id;
-  }
-
-  const rows = await db
-    .select({ id: farmProfileTable.id })
-    .from(farmProfileTable)
-    .orderBy(farmProfileTable.id)
-    .limit(1);
-  return rows[0]?.id ?? null;
+// Same estate scoping as farm.ts — see resolveActiveEstateId.
+function activeEstateId(req: Parameters<typeof effectiveOwnerId>[0]): Promise<number | null> {
+  return resolveActiveEstateId(req);
 }
 
 const CATEGORIES = ["fertilizer", "spray", "irrigation", "pruning", "harvest", "other"];

@@ -16,8 +16,12 @@ import subscriptionRouter from "./subscription";
 import yearPlanRouter from "./year-plan";
 import pushRouter from "./push";
 import walletRouter from "./wallet";
+import { enforceAccessRules } from "../middlewares/inviteeAccess";
 
 const router: IRouter = Router();
+
+// Sign-in and invitee rules for every route below — see inviteeAccess.ts.
+router.use(enforceAccessRules);
 
 router.use(healthRouter);
 router.use(farmRouter);
