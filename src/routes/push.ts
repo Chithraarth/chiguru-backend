@@ -7,8 +7,13 @@ import { effectiveOwnerId, resolveActiveEstateId } from "../middlewares/firebase
 const router = Router();
 
 // Same estate scoping as farm.ts — see resolveActiveEstateId.
-function activeEstateId(req: Parameters<typeof effectiveOwnerId>[0]): Promise<number | null> {
-  return resolveActiveEstateId(req);
+// When there's no estate (no farm yet, or signed out) this is NO_ESTATE, an id
+// no row has - so every estate-scoped query matches nothing. Returning null
+// made the many `eid != null ? eq(...) : undefined` filters drop out entirely
+// and return every farm's rows to anyone without a farm of their own.
+const NO_ESTATE = -1;
+async function activeEstateId(req: Parameters<typeof effectiveOwnerId>[0]): Promise<number> {
+  return (await resolveActiveEstateId(req)) ?? NO_ESTATE;
 }
 
 // Validate an IANA timezone name; Intl throws on unknown zones.
@@ -46,7 +51,8 @@ router.post("/push/register", async (req, res) => {
   await db
     .insert(pushDevicesTable)
     .values({
-      estateId: eid,
+      // A device on an account with no farm yet belongs to no estate.
+      estateId: eid === NO_ESTATE ? null : eid,
       deviceId,
       expoPushToken,
       ...(typeof midmonth === "boolean" ? { midmonthEnabled: midmonth } : {}),
@@ -56,7 +62,7 @@ router.post("/push/register", async (req, res) => {
     .onConflictDoUpdate({
       target: pushDevicesTable.expoPushToken,
       set: {
-        estateId: eid,
+        estateId: eid === NO_ESTATE ? null : eid,
         deviceId,
         // Only touch the mid-month preference when the client sent it, so a
         // plain re-register on app start never resets an opt-out.
@@ -103,7 +109,7 @@ router.get("/push/status", async (req, res) => {
     return;
   }
   const whereClause =
-    eid != null
+    eid !== NO_ESTATE
       ? and(eq(pushDevicesTable.deviceId, deviceId), eq(pushDevicesTable.estateId, eid))
       : eq(pushDevicesTable.deviceId, deviceId);
   const [row] = await db
@@ -146,7 +152,7 @@ router.post("/push/test", async (req, res) => {
   // Scope the lookup to both deviceId AND estate so a caller cannot trigger
   // notifications for a device belonging to a different estate.
   const whereClause =
-    eid != null
+    eid !== NO_ESTATE
       ? and(eq(pushDevicesTable.deviceId, deviceId), eq(pushDevicesTable.estateId, eid))
       : eq(pushDevicesTable.deviceId, deviceId);
 
