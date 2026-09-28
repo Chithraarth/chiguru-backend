@@ -73,6 +73,12 @@ router.post("/me/invites/:id/accept", async (req, res) => {
   const matchConditions = [];
   if (identity.phone) matchConditions.push(eq(managersTable.phone, identity.phone));
   if (identity.email) matchConditions.push(eq(managersTable.email, identity.email));
+  // No phone and no verified email: nothing can match. Without this, or()
+  // with no conditions drops out of the WHERE and any pending invite matches.
+  if (matchConditions.length === 0) {
+    res.status(404).json({ message: "Invite not found", code: "NOT_FOUND" });
+    return;
+  }
 
   const [row] = await db
     .select()
@@ -104,6 +110,12 @@ router.post("/me/invites/:id/decline", async (req, res) => {
   const matchConditions = [];
   if (identity.phone) matchConditions.push(eq(managersTable.phone, identity.phone));
   if (identity.email) matchConditions.push(eq(managersTable.email, identity.email));
+  // No phone and no verified email: nothing can match. Without this, or()
+  // with no conditions drops out of the WHERE and any pending invite matches.
+  if (matchConditions.length === 0) {
+    res.status(404).json({ message: "Invite not found", code: "NOT_FOUND" });
+    return;
+  }
 
   const [row] = await db
     .select()

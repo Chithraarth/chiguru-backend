@@ -32,7 +32,7 @@ import { requestOwnerKey, bodyOwnerKey } from "../lib/owner-key";
 import { sendSuggestionEmail } from "../lib/gmail";
 import { eq, and, or, gte, lte, lt, sql, desc, inArray, isNull, isNotNull } from "drizzle-orm";
 import type { PgColumn } from "drizzle-orm/pg-core";
-import { requireOwner, requireOwnerOrManager, effectiveOwnerId } from "../middlewares/firebaseAuth";
+import { requireOwner, requireOwnerOrManager, effectiveOwnerId, resolveActiveEstateId } from "../middlewares/firebaseAuth";
 import { requireActiveSubscription } from "../middlewares/subscriptionGate";
 import { getMaxEstates } from "../services/entitlement.service";
 
@@ -43,46 +43,42 @@ const router = Router();
 // "active estate" and sends its id in the X-Estate-Id header; data is scoped to it.
 // ──────────────────────────────────────────────────────────────────────────────
 
-// Resolve the active estate id for a request: the X-Estate-Id header if valid,
-// otherwise the oldest estate (first onboarded). Returns null when none exist yet.
-async function activeEstateId(
-  req: Parameters<typeof effectiveOwnerId>[0],
-): Promise<number | null> {
-  const ownerId = effectiveOwnerId(req) ?? undefined;
-  const h = req.header("X-Estate-Id");
-  const headerEid = h && !isNaN(Number(h)) ? Number(h) : null;
+// The estate this request's data is scoped to — see resolveActiveEstateId for
+// the rules (never another Owner's estate; a scoped invitee is pinned to theirs).
+function activeEstateId(req: Parameters<typeof effectiveOwnerId>[0]): Promise<number | null> {
+  return resolveActiveEstateId(req);
+}
 
-  if (headerEid != null) {
-    if (!ownerId) return headerEid; // No authenticated identity at all — preserve legacy fallback below.
-    // Never resolve to an estate that isn't actually owned by this request's
-    // Owner (whether signed in directly or via a Manager acting for them),
-    // even if the client sent a stale/forged header.
-    const [row] = await db
-      .select({ id: farmProfileTable.id })
-      .from(farmProfileTable)
-      .where(and(eq(farmProfileTable.id, headerEid), eq(farmProfileTable.ownerId, ownerId)))
-      .limit(1);
-    if (row) return row.id;
-  }
+// Fields a client may set on an estate. Never ownerId, recoveryCode or
+// ids/timestamps — spreading req.body straight into .set() let anyone who
+// could edit an estate reassign its owner.
+const EDITABLE_ESTATE_FIELDS = [
+  "farmName",
+  "contactPhone",
+  "alternatePhone",
+  "latitude",
+  "longitude",
+  "village",
+  "taluk",
+  "district",
+  "state",
+  "country",
+  "totalAcres",
+  "avgRainfallMm",
+  "climateZone",
+  "currency",
+] as const;
 
-  if (ownerId) {
-    const [row] = await db
-      .select({ id: farmProfileTable.id })
-      .from(farmProfileTable)
-      .where(eq(farmProfileTable.ownerId, ownerId))
-      .orderBy(farmProfileTable.id)
-      .limit(1);
-    return row?.id ?? null;
-  }
+function pickEstateFields(body: unknown, allowed: readonly string[] = EDITABLE_ESTATE_FIELDS) {
+  const src = (body ?? {}) as Record<string, unknown>;
+  return Object.fromEntries(allowed.filter((k) => k in src).map((k) => [k, src[k]]));
+}
 
-  // No authenticated Owner/Manager on this request — preserve the original
-  // single-farm-deployment fallback (oldest estate overall).
-  const rows = await db
-    .select({ id: farmProfileTable.id })
-    .from(farmProfileTable)
-    .orderBy(farmProfileTable.id)
-    .limit(1);
-  return rows[0]?.id ?? null;
+// The recovery code is a bearer secret for the whole farm — only ever
+// returned by GET /backup/code, never in estate lists or profile reads.
+function withoutRecoveryCode<T extends { recoveryCode?: unknown }>(row: T): Omit<T, "recoveryCode"> {
+  const { recoveryCode: _secret, ...rest } = row;
+  return rest;
 }
 
 // Build a WHERE clause that matches a row by id AND constrains it to the active
@@ -430,7 +426,7 @@ router.get("/me/estates", requireOwnerOrManager, async (req, res) => {
   const estates = [...seen.values()]
     .sort((a, b) => a.id - b.id)
     .map((estate) => ({
-      ...estate,
+      ...withoutRecoveryCode(estate),
       relationship: req.owner?.id === estate.ownerId ? ("own" as const) : ("invited" as const),
     }));
   return res.json(estates);
@@ -439,12 +435,13 @@ router.get("/me/estates", requireOwnerOrManager, async (req, res) => {
 // List the Owner's estates (newest first), so the switcher can show them —
 // a signed-in Manager can list them too, scoped to the Owner they work for.
 router.get("/estates", requireOwnerOrManager, async (req, res) => {
-  const rows = await db
-    .select()
-    .from(farmProfileTable)
-    .where(eq(farmProfileTable.ownerId, effectiveOwnerId(req)!))
-    .orderBy(farmProfileTable.id);
-  return res.json(rows);
+  // An invitee scoped to one estate only ever sees that estate.
+  const scope =
+    req.actorRole === "invitee" && req.inviteEstateId != null
+      ? and(eq(farmProfileTable.ownerId, effectiveOwnerId(req)!), eq(farmProfileTable.id, req.inviteEstateId))
+      : eq(farmProfileTable.ownerId, effectiveOwnerId(req)!);
+  const rows = await db.select().from(farmProfileTable).where(scope).orderBy(farmProfileTable.id);
+  return res.json(rows.map(withoutRecoveryCode));
 });
 
 router.post("/estates", requireOwner, async (req, res) => {
@@ -462,13 +459,15 @@ router.post("/estates", requireOwner, async (req, res) => {
       code: maxEstates === 0 ? "SUBSCRIPTION_REQUIRED" : "ESTATE_LIMIT_REACHED",
     });
   }
+  const farmName = typeof req.body?.farmName === "string" ? req.body.farmName.trim() : "";
+  if (!farmName) return res.status(400).json({ message: "Farm name is required" });
   // Every new farm gets a recovery code at creation so backup works from day one.
   const recoveryCode = await uniqueRecoveryCode();
   const [row] = await db
     .insert(farmProfileTable)
-    .values({ ...req.body, ownerId: req.owner!.id, recoveryCode })
+    .values({ ...pickEstateFields(req.body), farmName, ownerId: req.owner!.id, recoveryCode })
     .returning();
-  return res.status(201).json(row);
+  return res.status(201).json(withoutRecoveryCode(row));
 });
 
 // A manager acting for their linked owner may rename the estate too (e.g.
@@ -476,13 +475,22 @@ router.post("/estates", requireOwner, async (req, res) => {
 // actually linked to, same as every other manager-writable resource.
 router.patch("/estates/:id", requireOwnerOrManager, async (req, res) => {
   const ownerId = effectiveOwnerId(req);
+  const id = Number(req.params.id);
+  const isInvitee = req.actorRole === "invitee";
+  // An invitee may only rename (all the old Manager app could do), and only
+  // the estate their invite is for.
+  if (isInvitee && req.inviteEstateId != null && req.inviteEstateId !== id) {
+    return res.status(404).json({ message: "Not found" });
+  }
+  const fields = pickEstateFields(req.body, isInvitee ? ["farmName"] : EDITABLE_ESTATE_FIELDS);
+  if (Object.keys(fields).length === 0) return res.status(400).json({ message: "Nothing to update" });
   const [row] = await db
     .update(farmProfileTable)
-    .set({ ...req.body, updatedAt: new Date() })
-    .where(and(eq(farmProfileTable.id, Number(req.params.id)), eq(farmProfileTable.ownerId, ownerId!)))
+    .set({ ...fields, updatedAt: new Date() })
+    .where(and(eq(farmProfileTable.id, id), eq(farmProfileTable.ownerId, ownerId!)))
     .returning();
   if (!row) return res.status(404).json({ message: "Not found" });
-  return res.json(row);
+  return res.json(withoutRecoveryCode(row));
 });
 
 router.delete("/estates/:id", requireOwner, async (req, res) => {
@@ -570,19 +578,21 @@ router.get("/farm/profile", async (req, res) => {
     .where(eq(farmProfileTable.id, eid))
     .limit(1);
   if (rows.length === 0) return res.status(404).json({ message: "Not found" });
-  return res.json(rows[0]);
+  return res.json(withoutRecoveryCode(rows[0]));
 });
 
 router.patch("/farm/profile", async (req, res) => {
   const eid = await activeEstateId(req);
   if (eid == null) return res.status(404).json({ message: "Not found" });
+  const fields = pickEstateFields(req.body);
+  if (Object.keys(fields).length === 0) return res.status(400).json({ message: "Nothing to update" });
   const [row] = await db
     .update(farmProfileTable)
-    .set({ ...req.body, updatedAt: new Date() })
+    .set({ ...fields, updatedAt: new Date() })
     .where(eq(farmProfileTable.id, eid))
     .returning();
   if (!row) return res.status(404).json({ message: "Not found" });
-  return res.json(row);
+  return res.json(withoutRecoveryCode(row));
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
