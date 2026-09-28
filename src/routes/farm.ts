@@ -399,23 +399,40 @@ router.delete("/me/devices/:id", requireOwner, async (req, res) => {
 // can't use effectiveOwnerId (which needs that header to disambiguate) —
 // instead it lists everything req.owner/req.managers already resolved to.
 router.get("/me/estates", requireOwnerOrManager, async (req, res) => {
-  const ownerIds = new Set<number>();
-  if (req.owner) ownerIds.add(req.owner.id);
-  for (const m of req.managers) ownerIds.add(m.ownerId);
+  // Owned estates: every farm belonging to this person's own Owner account,
+  // if they have one — unaffected by any invite.
+  const ownedOwnerIds = new Set<number>();
+  if (req.owner) ownedOwnerIds.add(req.owner.id);
 
-  const rows =
-    ownerIds.size > 0
-      ? await db
-          .select()
-          .from(farmProfileTable)
-          .where(inArray(farmProfileTable.ownerId, [...ownerIds]))
-          .orderBy(farmProfileTable.id)
-      : [];
+  // Invited estates: an invite with an estateId only grants that one estate;
+  // an invite predating per-estate scoping (estateId null) still grants every
+  // estate that owner owns, same as before.
+  const invitedOwnerIdsUnscoped = new Set<number>();
+  const invitedEstateIds = new Set<number>();
+  for (const m of req.managers) {
+    if (m.estateId != null) invitedEstateIds.add(m.estateId);
+    else invitedOwnerIdsUnscoped.add(m.ownerId);
+  }
 
-  const estates = rows.map((estate) => ({
-    ...estate,
-    relationship: req.owner?.id === estate.ownerId ? ("own" as const) : ("invited" as const),
-  }));
+  const ownerIdsToList = new Set([...ownedOwnerIds, ...invitedOwnerIdsUnscoped]);
+  const [byOwner, byEstateId] = await Promise.all([
+    ownerIdsToList.size > 0
+      ? db.select().from(farmProfileTable).where(inArray(farmProfileTable.ownerId, [...ownerIdsToList]))
+      : Promise.resolve([]),
+    invitedEstateIds.size > 0
+      ? db.select().from(farmProfileTable).where(inArray(farmProfileTable.id, [...invitedEstateIds]))
+      : Promise.resolve([]),
+  ]);
+
+  const seen = new Map<number, (typeof byOwner)[number]>();
+  for (const estate of [...byOwner, ...byEstateId]) seen.set(estate.id, estate);
+
+  const estates = [...seen.values()]
+    .sort((a, b) => a.id - b.id)
+    .map((estate) => ({
+      ...estate,
+      relationship: req.owner?.id === estate.ownerId ? ("own" as const) : ("invited" as const),
+    }));
   return res.json(estates);
 });
 

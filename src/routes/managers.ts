@@ -27,7 +27,7 @@ router.get("/managers", requireOwner, async (req, res) => {
 // by simply signing into the Owner app with that same phone/email (see
 // firebaseAuthMiddleware).
 router.post("/managers", requireOwner, async (req, res) => {
-  const { name, phone, email } = req.body as { name?: string; phone?: string; email?: string };
+  const { name, phone, email, estateId } = req.body as { name?: string; phone?: string; email?: string; estateId?: number };
   const trimmedName = typeof name === "string" ? name.trim() : "";
   const trimmedPhone = typeof phone === "string" ? phone.trim() : "";
   const trimmedEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
@@ -46,6 +46,18 @@ router.post("/managers", requireOwner, async (req, res) => {
   }
   if (trimmedEmail && !EMAIL_RE.test(trimmedEmail)) {
     res.status(400).json({ message: "Invalid email address", code: "INVALID_EMAIL" });
+    return;
+  }
+  if (typeof estateId !== "number") {
+    res.status(400).json({ message: "An estate must be selected for this invite", code: "INVALID_ESTATE" });
+    return;
+  }
+  const [ownedEstate] = await db
+    .select({ id: farmProfileTable.id })
+    .from(farmProfileTable)
+    .where(and(eq(farmProfileTable.id, estateId), eq(farmProfileTable.ownerId, req.owner!.id)));
+  if (!ownedEstate) {
+    res.status(400).json({ message: "That estate doesn't belong to you", code: "INVALID_ESTATE" });
     return;
   }
 
@@ -81,6 +93,7 @@ router.post("/managers", requireOwner, async (req, res) => {
     .insert(managersTable)
     .values({
       ownerId: req.owner!.id,
+      estateId,
       name: trimmedName,
       phone: trimmedPhone || null,
       email: trimmedEmail || null,
@@ -92,9 +105,7 @@ router.post("/managers", requireOwner, async (req, res) => {
     const [farm] = await db
       .select({ farmName: farmProfileTable.farmName })
       .from(farmProfileTable)
-      .where(eq(farmProfileTable.ownerId, req.owner!.id))
-      .orderBy(farmProfileTable.id)
-      .limit(1);
+      .where(eq(farmProfileTable.id, estateId));
     sendInviteEmail({
       toEmail: trimmedEmail,
       inviteeName: trimmedName,

@@ -31,19 +31,32 @@ router.get("/me/invites", async (req, res) => {
     .select({
       id: managersTable.id,
       name: managersTable.name,
+      estateId: managersTable.estateId,
+      ownerId: managersTable.ownerId,
       ownerName: ownersTable.fullName,
-      farmName: farmProfileTable.farmName,
+      ownerEmail: ownersTable.email,
+      ownerPhone: ownersTable.mobileNumber,
       createdAt: managersTable.createdAt,
     })
     .from(managersTable)
     .innerJoin(ownersTable, eq(ownersTable.id, managersTable.ownerId))
-    .leftJoin(farmProfileTable, eq(farmProfileTable.ownerId, managersTable.ownerId))
     .where(and(or(...matchConditions), eq(managersTable.status, "pending")));
 
-  // One row per invite, not per (invite × farm) — an Owner can have several
-  // estates, but the invite itself isn't scoped to just one of them.
-  const seen = new Set<number>();
-  const invites = rows.filter((r) => (seen.has(r.id) ? false : (seen.add(r.id), true)));
+  // A scoped invite (estateId set) names that one estate; a legacy unscoped
+  // invite (estateId null) falls back to naming the Owner's first estate,
+  // same heuristic used before per-estate scoping existed. Resolved
+  // per-invite (not via a join) so each invite maps to exactly one farm name.
+  const invites = await Promise.all(
+    rows.map(async ({ estateId, ownerId, ...invite }) => {
+      const [farm] = await db
+        .select({ farmName: farmProfileTable.farmName })
+        .from(farmProfileTable)
+        .where(estateId != null ? eq(farmProfileTable.id, estateId) : eq(farmProfileTable.ownerId, ownerId))
+        .orderBy(farmProfileTable.id)
+        .limit(1);
+      return { ...invite, farmName: farm?.farmName ?? null };
+    }),
+  );
   res.json(invites);
 });
 

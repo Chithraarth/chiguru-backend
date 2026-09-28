@@ -158,9 +158,11 @@ export function requireOwnerOrManager(req: Request, res: Response, next: NextFun
  * Resolution order:
  *  1. X-Estate-Id header, if present: look up which Owner that estate
  *     actually belongs to, then confirm this person may act for that
- *     Owner (it's their own estate, or one of their active invites is for
- *     that same Owner). This is the only path that can disambiguate when a
- *     person holds several invites, or is both an Owner and an invitee.
+ *     Owner — either it's their own estate, or one of their active invites
+ *     is for that same Owner AND (that invite has no estateId, i.e. it
+ *     predates per-estate scoping, or its estateId matches this exact
+ *     estate). This is the only path that can disambiguate when a person
+ *     holds several invites, or is both an Owner and an invitee.
  *  2. No header, or it didn't resolve to an estate this person may act on:
  *     fall back to the legacy behavior (req.owner if signed in as Owner,
  *     else the sole invite's Owner) — keeps older app builds that never
@@ -177,7 +179,8 @@ async function resolveOwnerId(req: Request): Promise<number | null> {
       .where(eq(farmProfileTable.id, estateId));
     if (estate?.ownerId != null) {
       const canActForThisOwner =
-        req.owner?.id === estate.ownerId || req.managers.some((m) => m.ownerId === estate.ownerId);
+        req.owner?.id === estate.ownerId ||
+        req.managers.some((m) => m.ownerId === estate.ownerId && (m.estateId == null || m.estateId === estateId));
       if (canActForThisOwner) return estate.ownerId;
     }
   }

@@ -2,6 +2,7 @@ import { pgTable, serial, integer, text, timestamp } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 import { ownersTable } from "./owners";
+import { farmProfileTable } from "./farm";
 
 // ── Invitee accounts (per Owner) ─────────────────────────────────────────────
 // An invitee (still "manager" in code/DB for now) is a person the Owner has
@@ -18,6 +19,11 @@ import { ownersTable } from "./owners";
 export const managersTable = pgTable("managers", {
   id: serial("id").primaryKey(),
   ownerId: integer("owner_id").notNull().references(() => ownersTable.id),
+  // Which one of the Owner's estates this invite grants access to. Nullable
+  // only for rows created before per-estate scoping existed — those keep
+  // legacy behavior (access to every estate that ownerId owns) rather than
+  // being silently locked out; every new invite must set this.
+  estateId: integer("estate_id").references(() => farmProfileTable.id),
   name: text("name").notNull(),
   // E.164 (e.g. "+919876543210") — matched against the Firebase ID token's
   // phone_number claim, never typed by the invitee themselves.
