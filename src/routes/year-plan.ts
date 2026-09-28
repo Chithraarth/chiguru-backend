@@ -19,8 +19,13 @@ function requireWalletCredit(feature: string) {
 }
 
 // Same estate scoping as farm.ts — see resolveActiveEstateId.
-function activeEstateId(req: Parameters<typeof effectiveOwnerId>[0]): Promise<number | null> {
-  return resolveActiveEstateId(req);
+// When there's no estate (no farm yet, or signed out) this is NO_ESTATE, an id
+// no row has - so every estate-scoped query matches nothing. Returning null
+// made the many `eid != null ? eq(...) : undefined` filters drop out entirely
+// and return every farm's rows to anyone without a farm of their own.
+const NO_ESTATE = -1;
+async function activeEstateId(req: Parameters<typeof effectiveOwnerId>[0]): Promise<number> {
+  return (await resolveActiveEstateId(req)) ?? NO_ESTATE;
 }
 
 const CATEGORIES = ["fertilizer", "spray", "irrigation", "pruning", "harvest", "other"];
@@ -145,7 +150,7 @@ router.delete("/plan-tasks/:id", async (req, res) => {
 // AI generation: build the next 12 months of tasks from the farm profile + crops.
 router.post("/plan-tasks/generate", requireActiveSubscription, requireWalletCredit("year_plan"), async (req, res) => {
   const eid = await activeEstateId(req);
-  if (eid == null) { res.status(400).json({ message: "Set up your farm first" }); return; }
+  if (eid === NO_ESTATE) { res.status(400).json({ message: "Set up your farm first" }); return; }
 
   const [profile] = await db.select().from(farmProfileTable).where(eq(farmProfileTable.id, eid));
   const crops = await db.select().from(cropsTable).where(eq(cropsTable.estateId, eid));

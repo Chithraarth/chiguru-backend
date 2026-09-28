@@ -45,8 +45,13 @@ const router = Router();
 
 // The estate this request's data is scoped to — see resolveActiveEstateId for
 // the rules (never another Owner's estate; a scoped invitee is pinned to theirs).
-function activeEstateId(req: Parameters<typeof effectiveOwnerId>[0]): Promise<number | null> {
-  return resolveActiveEstateId(req);
+// When there's no estate (no farm yet, or signed out) this is NO_ESTATE, an id
+// no row has - so every estate-scoped query matches nothing. Returning null
+// made the many `eid != null ? eq(...) : undefined` filters drop out entirely
+// and return every farm's rows to anyone without a farm of their own.
+const NO_ESTATE = -1;
+async function activeEstateId(req: Parameters<typeof effectiveOwnerId>[0]): Promise<number> {
+  return (await resolveActiveEstateId(req)) ?? NO_ESTATE;
 }
 
 // Fields a client may set on an estate. Never ownerId, recoveryCode or
@@ -135,8 +140,8 @@ async function binnedGroupInEstate(groupId: number, eid: number | null): Promise
 
 // True when the given worker belongs to the active estate. Guards routes that
 // accept a workerId from the client (loan create) against cross-estate linking.
-async function workerInEstate(workerId: number | null | undefined, eid: number | null): Promise<boolean> {
-  if (eid == null || workerId == null) return true;
+async function workerInEstate(workerId: number | null | undefined, eid: number): Promise<boolean> {
+  if (workerId == null) return true;
   const [w] = await db
     .select({ id: workersTable.id })
     .from(workersTable)
@@ -157,8 +162,8 @@ function estateCropIds(eid: number) {
 // True when the given crop belongs to the active estate (or is unset). Guards
 // routes that accept a cropId from the client (blocks/work-groups create+update)
 // against cross-estate linking.
-async function cropInEstate(cropId: number | null | undefined, eid: number | null): Promise<boolean> {
-  if (eid == null || cropId == null) return true;
+async function cropInEstate(cropId: number | null | undefined, eid: number): Promise<boolean> {
+  if (cropId == null) return true;
   const [c] = await db
     .select({ id: cropsTable.id })
     .from(cropsTable)
@@ -209,7 +214,7 @@ function normalizeCode(input: string): string | null {
 // Get (creating on first use) the recovery code for the active estate.
 router.get("/backup/code", async (req, res) => {
   const eid = await activeEstateId(req);
-  if (eid == null) return res.status(404).json({ message: "No farm found yet" });
+  if (eid === NO_ESTATE) return res.status(404).json({ message: "No farm found yet" });
   const [estate] = await db
     .select({ id: farmProfileTable.id, farmName: farmProfileTable.farmName, recoveryCode: farmProfileTable.recoveryCode })
     .from(farmProfileTable)
@@ -262,7 +267,7 @@ router.get("/me/farms", requireOwner, async (req, res) => {
 // is already linked to a different Owner.
 router.post("/me/link-farm", requireOwner, async (req, res) => {
   const eid = await activeEstateId(req);
-  if (eid == null) return res.status(404).json({ message: "No farm found yet" });
+  if (eid === NO_ESTATE) return res.status(404).json({ message: "No farm found yet" });
   const [estate] = await db
     .select({ id: farmProfileTable.id, farmName: farmProfileTable.farmName, ownerId: farmProfileTable.ownerId })
     .from(farmProfileTable)
@@ -284,7 +289,7 @@ router.post("/me/link-farm", requireOwner, async (req, res) => {
 // Unlink the active farm from the signed-in Owner.
 router.post("/me/unlink-farm", requireOwner, async (req, res) => {
   const eid = await activeEstateId(req);
-  if (eid == null) return res.status(404).json({ message: "No farm found yet" });
+  if (eid === NO_ESTATE) return res.status(404).json({ message: "No farm found yet" });
   const [row] = await db
     .update(farmProfileTable)
     .set({ ownerId: null, updatedAt: new Date() })
@@ -571,7 +576,7 @@ router.delete("/estates/:id", requireOwner, async (req, res) => {
 
 router.get("/farm/profile", async (req, res) => {
   const eid = await activeEstateId(req);
-  if (eid == null) return res.status(404).json({ message: "Not found" });
+  if (eid === NO_ESTATE) return res.status(404).json({ message: "Not found" });
   const rows = await db
     .select()
     .from(farmProfileTable)
@@ -583,7 +588,7 @@ router.get("/farm/profile", async (req, res) => {
 
 router.patch("/farm/profile", async (req, res) => {
   const eid = await activeEstateId(req);
-  if (eid == null) return res.status(404).json({ message: "Not found" });
+  if (eid === NO_ESTATE) return res.status(404).json({ message: "Not found" });
   const fields = pickEstateFields(req.body);
   if (Object.keys(fields).length === 0) return res.status(400).json({ message: "Nothing to update" });
   const [row] = await db
@@ -2222,7 +2227,7 @@ Guidelines:
 
 router.post("/help-messages", async (req, res) => {
   const eid = await activeEstateId(req);
-  if (eid == null) return res.status(400).json({ message: "No active farm" });
+  if (eid === NO_ESTATE) return res.status(400).json({ message: "No active farm" });
   const { type, message, phone } = req.body ?? {};
   if (type !== "question" && type !== "suggestion") {
     return res.status(400).json({ message: "Invalid type" });
