@@ -4,6 +4,7 @@ import { db, paymentsTable, subscriptionPlansTable, ownersTable } from "../db";
 import { requireOwner } from "../middlewares/firebaseAuth";
 import {
   getCurrentSubscription,
+  isSubActive,
   getPlan,
   getManagerLimit,
   getManagersUsed,
@@ -74,12 +75,15 @@ router.get("/subscriptions/me", requireOwner, async (req, res) => {
   res.json({
     subscription: sub
       ? {
-          status: sub.status,
+          // A cancelled plan still inside its paid period is reported as ACTIVE
+          // (with autoRenew off) so every client shows it as the current plan
+          // with "access continues until <expiry>" instead of asking to buy again.
+          status: sub.status === "CANCELLED" && isSubActive(sub) ? "ACTIVE" : sub.status,
           platform: sub.platform,
           provider: sub.provider,
           startDate: sub.startDate,
           expiryDate: sub.expiryDate,
-          autoRenew: sub.autoRenew,
+          autoRenew: sub.status === "CANCELLED" ? false : sub.autoRenew,
           cancelledAt: sub.cancelledAt,
           plan: plan ? { id: plan.id, name: plan.name, managerLimit: plan.managerLimit, price: Number(plan.price) } : null,
         }

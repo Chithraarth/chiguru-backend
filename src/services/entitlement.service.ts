@@ -10,13 +10,15 @@ const ACTIVE_LIKE_STATUSES = ["ACTIVE", "GRACE_PERIOD"];
  * themselves, and the React frontend never gets to decide this on its own.
  */
 export async function getCurrentSubscription(ownerId: number): Promise<Subscription | null> {
-  const [sub] = await db
+  const subs = await db
     .select()
     .from(subscriptionsTable)
     .where(eq(subscriptionsTable.ownerId, ownerId))
-    .orderBy(desc(subscriptionsTable.id))
-    .limit(1);
-  return sub ?? null;
+    .orderBy(desc(subscriptionsTable.id));
+  // The newest row that still grants access wins over newer rows that don't -
+  // e.g. an abandoned checkout (PENDING) started after the plan was paid for
+  // must not hide the paid plan. Otherwise the newest row, as before.
+  return subs.find((s) => isSubActive(s)) ?? subs[0] ?? null;
 }
 
 export async function getPlan(ownerId: number): Promise<SubscriptionPlan | null> {
@@ -31,9 +33,19 @@ export function isSubStatusActiveLike(status: string): boolean {
   return ACTIVE_LIKE_STATUSES.includes(status);
 }
 
+/**
+ * Whether this subscription row grants access right now. A CANCELLED plan
+ * keeps its access until the period already paid for ends (expiryDate) -
+ * cancelling only stops the next renewal, it never takes away paid days.
+ */
+export function isSubActive(sub: Pick<Subscription, "status" | "expiryDate">, now: Date = new Date()): boolean {
+  if (isSubStatusActiveLike(sub.status)) return true;
+  return sub.status === "CANCELLED" && !!sub.expiryDate && sub.expiryDate.getTime() > now.getTime();
+}
+
 export async function isSubscriptionActive(ownerId: number): Promise<boolean> {
   const sub = await getCurrentSubscription(ownerId);
-  return !!sub && isSubStatusActiveLike(sub.status);
+  return !!sub && isSubActive(sub);
 }
 
 export async function getManagerLimit(ownerId: number): Promise<number> {
