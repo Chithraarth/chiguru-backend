@@ -31,9 +31,7 @@ const APPLE_APP_ID = process.env.APPLE_APP_ID ? Number(process.env.APPLE_APP_ID)
 // Subscriptions are DB-driven: subscription_plans.apple_product_id.
 /** Wallet credit packs (consumables): product id → rupees credited. */
 export const APPLE_WALLET_PACKS: Record<string, number> = {
-  "com.thechiguru.owner.wallet.299": 299,
-  "com.thechiguru.owner.wallet.499": 499,
-  "com.thechiguru.owner.wallet.999": 999,
+  "com.thechiguru.owner.wallet.599": 599,
 };
 /** One extra invitee seat (consumable, one-time). */
 export const APPLE_SEAT_PRODUCT_ID = "com.thechiguru.owner.invitee_seat";
