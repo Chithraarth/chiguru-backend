@@ -15,6 +15,8 @@ import {
   createRazorpaySubscription,
   verifyAndActivate,
   verifyAndActivateGooglePlay,
+  verifyAndActivateApple,
+  handleAppleNotification,
   cancel,
   handleWebhookEvent,
   handleGooglePlayNotification,
@@ -22,6 +24,7 @@ import {
 } from "../services/subscription.service";
 import { verifyWebhookSignature, createOneTimeOrder, verifyOrderPaymentSignature, RAZORPAY_KEY_ID } from "../lib/razorpay";
 import { logger } from "../lib/logger";
+import { verifyAppleTransaction, applePaymentKey, APPLE_SEAT_PRODUCT_ID, AppleVerificationError } from "../lib/apple";
 
 // One-time price for a permanent +1 manager seat add-on — never expires,
 // unlike a subscription. Fixed (not user-entered) since this buys exactly
@@ -31,7 +34,7 @@ const MANAGER_SEAT_ADDON_PRICE = 99;
 const router: IRouter = Router();
 
 function sendServiceError(res: Response, err: unknown) {
-  if (err instanceof SubscriptionServiceError) {
+  if (err instanceof SubscriptionServiceError || err instanceof AppleVerificationError) {
     res.status(err.status).json({ message: err.message, code: err.code });
     return;
   }
@@ -56,6 +59,7 @@ router.get("/subscriptions/plans", async (_req, res) => {
       billingPeriod: p.billingPeriod,
       managerLimit: p.managerLimit,
       googlePlayProductId: p.googlePlayProductId,
+      appleProductId: p.appleProductId,
     })),
   });
 });
@@ -88,6 +92,7 @@ router.get("/subscriptions/me", requireOwner, async (req, res) => {
           plan: plan ? { id: plan.id, name: plan.name, managerLimit: plan.managerLimit, price: Number(plan.price) } : null,
         }
       : null,
+    appleSeatProductId: APPLE_SEAT_PRODUCT_ID,
     entitlement: {
       managerLimit,
       managersUsed,
@@ -122,12 +127,41 @@ router.post("/subscriptions/manager-seat-addon/verify", requireOwner, async (req
     return;
   }
 
-  const ownerId = req.owner!.id;
-  const result = await db.transaction(async (tx) => {
+  const result = await grantManagerSeat(req.owner!.id, "RAZORPAY", paymentId);
+  res.json({ ok: true, ...result });
+});
+
+/**
+ * iPhone seat add-on: body {signedTransaction} — StoreKit 2 JWS for the
+ * invitee-seat consumable. Same one-seat-per-payment guarantee as Razorpay,
+ * keyed by apple:<transactionId>.
+ */
+router.post("/subscriptions/manager-seat-addon/apple/verify", requireOwner, async (req, res) => {
+  const { signedTransaction } = req.body as { signedTransaction?: string };
+  try {
+    const tx = await verifyAppleTransaction(signedTransaction ?? "");
+    if (tx.productId !== APPLE_SEAT_PRODUCT_ID || !tx.transactionId || tx.revocationDate) {
+      res.status(422).json({ message: "This purchase isn't a Chiguru seat add-on.", code: "NOT_A_SEAT_ADDON" });
+      return;
+    }
+    const result = await grantManagerSeat(req.owner!.id, "APPLE", applePaymentKey(tx.transactionId));
+    if ("conflict" in result) {
+      res.status(409).json({ message: "This purchase was already used on another account.", code: "PURCHASE_ALREADY_USED" });
+      return;
+    }
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    sendServiceError(res, err);
+  }
+});
+
+/** Permanently adds +1 seat, at most once per payment id (any provider). */
+async function grantManagerSeat(ownerId: number, provider: "RAZORPAY" | "APPLE", paymentKey: string) {
+  return db.transaction(async (tx) => {
     const existing = await tx
-      .select({ id: paymentsTable.id })
+      .select({ id: paymentsTable.id, ownerId: paymentsTable.ownerId })
       .from(paymentsTable)
-      .where(eq(paymentsTable.providerPaymentId, paymentId))
+      .where(eq(paymentsTable.providerPaymentId, paymentKey))
       .limit(1);
 
     const [owner] = await tx
@@ -136,6 +170,7 @@ router.post("/subscriptions/manager-seat-addon/verify", requireOwner, async (req
       .where(eq(ownersTable.id, ownerId))
       .for("update");
 
+    if (existing[0] && existing[0].ownerId !== ownerId) return { conflict: true as const };
     if (existing[0]) return { extraManagerSeats: owner?.extraManagerSeats ?? 0, duplicate: true };
 
     const [updated] = await tx
@@ -146,8 +181,8 @@ router.post("/subscriptions/manager-seat-addon/verify", requireOwner, async (req
 
     await tx.insert(paymentsTable).values({
       ownerId,
-      provider: "RAZORPAY",
-      providerPaymentId: paymentId,
+      provider,
+      providerPaymentId: paymentKey,
       amount: String(MANAGER_SEAT_ADDON_PRICE),
       paymentStatus: "succeeded",
       paymentDate: new Date(),
@@ -155,9 +190,7 @@ router.post("/subscriptions/manager-seat-addon/verify", requireOwner, async (req
 
     return { extraManagerSeats: updated.extraManagerSeats, duplicate: false };
   });
-
-  res.json({ ok: true, ...result });
-});
+}
 
 // POST /api/subscriptions/razorpay/create — body {planId} only. Everything
 // else the client might try to send (price, razorpayPlanId, ownerId) is
@@ -213,6 +246,23 @@ router.post("/subscriptions/android/verify", requireOwner, async (req, res) => {
   try {
     const sub = await verifyAndActivateGooglePlay(req.owner!.id, { purchaseToken, productId });
     res.json({ status: sub.status });
+  } catch (err) {
+    sendServiceError(res, err);
+  }
+});
+
+// POST /api/subscriptions/apple/verify — body {signedTransaction}: the
+// StoreKit 2 JWS. Apple's signature is verified server-side before anything
+// is written (see lib/apple.ts).
+router.post("/subscriptions/apple/verify", requireOwner, async (req, res) => {
+  const { signedTransaction } = req.body as { signedTransaction?: string };
+  if (!signedTransaction) {
+    res.status(400).json({ message: "signedTransaction is required", code: "INVALID_REQUEST" });
+    return;
+  }
+  try {
+    const sub = await verifyAndActivateApple(req.owner!.id, signedTransaction);
+    res.json({ status: sub.status, expiryDate: sub.expiryDate });
   } catch (err) {
     sendServiceError(res, err);
   }
@@ -292,5 +342,24 @@ export async function googlePlayWebhookHandler(req: Request, res: Response) {
     // needs a server-side fix, not something a retry can resolve.
   }
 
+  res.json({ received: true });
+}
+
+// ── App Store Server Notifications V2 ───────────────────────────────────────
+// Body {signedPayload}: a JWS signed by Apple, verified against Apple's root
+// CA before use, so no shared secret is needed. Mounted after express.json().
+export async function appleWebhookHandler(req: Request, res: Response) {
+  const { signedPayload } = (req.body ?? {}) as { signedPayload?: string };
+  try {
+    await handleAppleNotification(signedPayload ?? "");
+  } catch (err) {
+    if (err instanceof AppleVerificationError) {
+      logger.warn("Apple webhook signature verification failed");
+      res.status(400).send("Invalid signature");
+      return;
+    }
+    logger.error({ err }, "Failed processing Apple webhook");
+    // Still 200 so Apple doesn't retry a bug that needs a server-side fix.
+  }
   res.json({ received: true });
 }
