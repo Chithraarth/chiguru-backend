@@ -14,6 +14,7 @@ import { razorpay, ensureRazorpayPlanId, totalCountForPeriod, verifyCheckoutSign
 import { fetchSubscriptionState, acknowledgePurchase, decodePubSubMessage } from "../lib/google-play";
 import { getCurrentSubscription, isSubStatusActiveLike, getManagersUsed } from "./entitlement.service";
 import { logger } from "../lib/logger";
+import { verifyAppleTransaction, verifyAppleNotification, verifyAppleRenewalInfo, applePaymentKey } from "../lib/apple";
 
 export class SubscriptionServiceError extends Error {
   status: number;
@@ -152,6 +153,12 @@ export async function cancel(ownerId: number): Promise<Subscription> {
   const sub = await getCurrentSubscription(ownerId);
   if (!sub || !sub.providerSubscriptionId || !isSubStatusActiveLike(sub.status)) {
     throw new SubscriptionServiceError(404, "NO_ACTIVE_SUBSCRIPTION", "No active subscription to cancel.");
+  }
+
+  if (sub.provider === "APPLE") {
+    // Apple subscriptions can only be cancelled by the subscriber in their
+    // Apple account settings; the App Store notification updates our row.
+    throw new SubscriptionServiceError(409, "MANAGE_VIA_APPLE", "Manage this subscription from your Apple account (Settings → your name → Subscriptions).");
   }
 
   if (sub.provider === "GOOGLE_PLAY") {
@@ -402,4 +409,148 @@ export async function handleWebhookEvent(rawBody: string, eventIdHeader: string 
   }
 
   logger.info({ ownerId: row.ownerId, subscriptionId, type: event.event }, "WEBHOOK_PROCESSED");
+}
+
+// ── Apple In-App Purchase ────────────────────────────────────────────────────
+
+/**
+ * Verifies a StoreKit 2 signed subscription transaction (Apple's signature,
+ * never the client's word) and activates/updates the owner's subscription.
+ * The subscription is keyed by Apple's originalTransactionId, which stays the
+ * same across renewals, so renewals and notifications find the same row.
+ */
+export async function verifyAndActivateApple(ownerId: number, signedTransaction: string): Promise<Subscription> {
+  const tx = await verifyAppleTransaction(signedTransaction);
+  if (tx.type !== "Auto-Renewable Subscription" || !tx.productId || !tx.originalTransactionId || !tx.transactionId) {
+    throw new SubscriptionServiceError(422, "NOT_A_SUBSCRIPTION", "This purchase isn't a Chiguru subscription.");
+  }
+  const [plan] = await db.select().from(subscriptionPlansTable).where(eq(subscriptionPlansTable.appleProductId, tx.productId));
+  if (!plan) {
+    throw new SubscriptionServiceError(404, "PLAN_NOT_FOUND", "No plan matches this App Store product.");
+  }
+
+  const expiry = tx.expiresDate ? new Date(tx.expiresDate) : null;
+  const active = !tx.revocationDate && !!expiry && expiry.getTime() > Date.now();
+  if (!active) {
+    throw new SubscriptionServiceError(422, "SUBSCRIPTION_NOT_ACTIVE", "Apple reports this subscription as expired or refunded.");
+  }
+
+  const [existing] = await db
+    .select()
+    .from(subscriptionsTable)
+    .where(eq(subscriptionsTable.providerSubscriptionId, tx.originalTransactionId));
+  if (existing && existing.ownerId !== ownerId) {
+    // One Apple ID's subscription can't unlock two Chiguru accounts.
+    throw new SubscriptionServiceError(409, "APPLE_SUBSCRIPTION_IN_USE", "This Apple subscription is already linked to another Chiguru account.");
+  }
+
+  const values = {
+    planId: plan.id,
+    providerPlanId: tx.productId,
+    providerPaymentId: tx.transactionId,
+    status: "ACTIVE",
+    startDate: tx.originalPurchaseDate ? new Date(tx.originalPurchaseDate) : new Date(),
+    expiryDate: expiry,
+    updatedAt: new Date(),
+  };
+  const [row] = existing
+    ? await db.update(subscriptionsTable).set(values).where(eq(subscriptionsTable.id, existing.id)).returning()
+    : await db
+        .insert(subscriptionsTable)
+        .values({ ...values, ownerId, platform: "IOS", provider: "APPLE", providerSubscriptionId: tx.originalTransactionId, autoRenew: true })
+        .returning();
+
+  await db
+    .insert(paymentsTable)
+    .values({
+      ownerId,
+      subscriptionId: row.id,
+      provider: "APPLE",
+      providerPaymentId: applePaymentKey(tx.transactionId),
+      amount: plan.price,
+      currency: plan.currency,
+      paymentStatus: "succeeded",
+      paymentDate: tx.purchaseDate ? new Date(tx.purchaseDate) : new Date(),
+    })
+    .onConflictDoNothing();
+
+  logger.info({ ownerId, originalTransactionId: tx.originalTransactionId, env: tx.verifiedEnv }, "APPLE_SUBSCRIPTION_ACTIVATED");
+  return row;
+}
+
+/**
+ * App Store Server Notifications V2. Verified with Apple's signature, made
+ * idempotent by notificationUUID, then the subscription row (found by
+ * originalTransactionId) is moved to the state the notification describes.
+ */
+export async function handleAppleNotification(signedPayload: string): Promise<void> {
+  const n = await verifyAppleNotification(signedPayload);
+  const eventId = n.notificationUUID ?? crypto.createHash("sha256").update(signedPayload).digest("hex");
+  const inserted = await db
+    .insert(webhookEventsTable)
+    .values({ provider: "APPLE", providerEventId: eventId, eventType: [n.notificationType, n.subtype].filter(Boolean).join(":") })
+    .onConflictDoNothing()
+    .returning();
+  if (inserted.length === 0) {
+    logger.info({ eventId }, "APPLE_WEBHOOK_PROCESSED (duplicate, ignored)");
+    return;
+  }
+
+  const signedTx = n.data?.signedTransactionInfo;
+  if (!signedTx) {
+    logger.info({ type: n.notificationType }, "APPLE_WEBHOOK_PROCESSED (no transaction, ignored)");
+    return;
+  }
+  const tx = await verifyAppleTransaction(signedTx);
+  const renewal = n.data?.signedRenewalInfo ? await verifyAppleRenewalInfo(n.data.signedRenewalInfo) : null;
+  if (!tx.originalTransactionId) return;
+
+  const [row] = await db.select().from(subscriptionsTable).where(eq(subscriptionsTable.providerSubscriptionId, tx.originalTransactionId));
+  if (!row) {
+    // Bought on iOS but never verified by the app yet (e.g. app closed
+    // mid-purchase) - the app's verify call creates the row on next launch.
+    logger.warn({ originalTransactionId: tx.originalTransactionId, type: n.notificationType }, "Apple webhook for unknown subscription");
+    return;
+  }
+
+  const type = String(n.notificationType);
+  const subtype = n.subtype ? String(n.subtype) : "";
+  let status = row.status;
+  if (type === "SUBSCRIBED" || type === "DID_RENEW" || type === "OFFER_REDEEMED" || type === "DID_CHANGE_RENEWAL_PREF") status = "ACTIVE";
+  else if (type === "DID_FAIL_TO_RENEW") status = subtype === "GRACE_PERIOD" ? "GRACE_PERIOD" : "ON_HOLD";
+  else if (type === "GRACE_PERIOD_EXPIRED") status = "ON_HOLD";
+  else if (type === "EXPIRED" || type === "REFUND" || type === "REVOKE") status = "EXPIRED";
+
+  await db
+    .update(subscriptionsTable)
+    .set({
+      status,
+      expiryDate: tx.expiresDate ? new Date(tx.expiresDate) : row.expiryDate,
+      autoRenew: renewal ? renewal.autoRenewStatus === 1 : row.autoRenew,
+      cancelledAt: renewal && renewal.autoRenewStatus === 0 && !row.cancelledAt ? new Date() : row.cancelledAt,
+      providerPaymentId: tx.transactionId ?? row.providerPaymentId,
+      updatedAt: new Date(),
+    })
+    .where(eq(subscriptionsTable.id, row.id));
+
+  if (type === "DID_RENEW" && tx.transactionId) {
+    const plan = await getPlanOrThrow(row.planId).catch(() => null);
+    if (plan) {
+      await db
+        .insert(paymentsTable)
+        .values({
+          ownerId: row.ownerId,
+          subscriptionId: row.id,
+          provider: "APPLE",
+          providerPaymentId: applePaymentKey(tx.transactionId),
+          amount: plan.price,
+          currency: plan.currency,
+          paymentStatus: "succeeded",
+          paymentDate: tx.purchaseDate ? new Date(tx.purchaseDate) : new Date(),
+        })
+        .onConflictDoNothing();
+    }
+  }
+
+  logger.info({ ownerId: row.ownerId, originalTransactionId: tx.originalTransactionId, type, subtype, status }, "APPLE_WEBHOOK_PROCESSED");
 }

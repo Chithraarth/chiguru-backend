@@ -3,7 +3,7 @@ import cors from "cors";
 import compression from "compression";
 import pinoHttp from "pino-http";
 import { firebaseAuthMiddleware } from "./middlewares/firebaseAuth";
-import { razorpayWebhookHandler, googlePlayWebhookHandler } from "./routes/subscription";
+import { razorpayWebhookHandler, googlePlayWebhookHandler, appleWebhookHandler } from "./routes/subscription";
 import router from "./routes";
 import { logger } from "./lib/logger";
 
@@ -45,6 +45,10 @@ app.use(express.urlencoded({ extended: true, limit: "20mb" }));
 // Google Play's Pub/Sub push has no signature header to verify against raw
 // bytes (unlike Razorpay above) — a normal parsed JSON body is fine here.
 app.post("/api/webhooks/google-play", googlePlayWebhookHandler);
+
+// App Store Server Notifications V2 carry their own Apple signature (JWS)
+// inside the JSON body, verified in the handler — parsed JSON is fine.
+app.post("/api/webhooks/apple", appleWebhookHandler);
 
 // Verifies a Firebase ID token if present and attaches req.owner — never
 // blocks by itself (see requireOwner for routes that must be signed in).

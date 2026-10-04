@@ -31,6 +31,9 @@ export const subscriptionPlansTable = pgTable("subscription_plans", {
   // products/base plans can only be created by hand in Play Console —
   // Monetization → Subscriptions — then the product id is pasted in here.
   googlePlayProductId: text("google_play_product_id"),
+  // Auto-renewable subscription product id from App Store Connect
+  // (Monetization → Subscriptions), pasted in by hand like the Play one.
+  appleProductId: text("apple_product_id"),
   active: boolean("active").notNull().default(true),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
