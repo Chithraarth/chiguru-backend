@@ -97,6 +97,7 @@ const INVITEE_ACCOUNT_ROUTES: Route[] = [
   route("GET", "/me/devices"),
   route("DELETE", "/me/devices/:id"),
   route("GET", "/owners/me"),
+  route("DELETE", "/owners/me"),
   route("GET", "/subscriptions/me"),
 ];
 
