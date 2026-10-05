@@ -2,6 +2,8 @@ import { Router, type IRouter } from "express";
 import { eq, count } from "drizzle-orm";
 import { db, farmProfileTable } from "../db";
 import { requireOwner } from "../middlewares/firebaseAuth";
+import { requestOwnerKey } from "../lib/owner-key";
+import { deleteOwnerAccount } from "../services/account-deletion.service";
 
 const router: IRouter = Router();
 
@@ -15,6 +17,15 @@ router.get("/owners/me", requireOwner, async (req, res) => {
     .where(eq(farmProfileTable.ownerId, req.owner!.id));
 
   res.json({ owner: req.owner, hasEstate: estateCount > 0 });
+});
+
+// DELETE /api/owners/me — permanently deletes the signed-in person's account
+// and all of its data (App Store guideline 5.1.1(v); the same button exists
+// on Android and the web). X-Owner-Key, when the device sends it, also
+// removes that device's classified ads. Irreversible by design.
+router.delete("/owners/me", requireOwner, async (req, res) => {
+  await deleteOwnerAccount(req.owner!.id, { ownerKey: requestOwnerKey(req) || null });
+  res.json({ deleted: true });
 });
 
 export default router;

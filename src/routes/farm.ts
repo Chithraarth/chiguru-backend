@@ -34,7 +34,8 @@ import { eq, and, or, gte, lte, lt, sql, desc, inArray, isNull, isNotNull } from
 import type { PgColumn } from "drizzle-orm/pg-core";
 import { requireOwner, requireOwnerOrManager, effectiveOwnerId, resolveActiveEstateId } from "../middlewares/firebaseAuth";
 import { requireActiveSubscription } from "../middlewares/subscriptionGate";
-import { getMaxEstates } from "../services/entitlement.service";
+import { getMaxEstates, isSubscriptionActive } from "../services/entitlement.service";
+import { deleteEstateData } from "../services/account-deletion.service";
 
 const router = Router();
 
@@ -511,62 +512,7 @@ router.delete("/estates/:id", requireOwner, async (req, res) => {
   if (!all.some((e) => e.id === id)) {
     return res.status(404).json({ message: "Not found" });
   }
-  // Cascade: the estate's child rows (and their grandchildren) reference it via
-  // FKs with no ON DELETE CASCADE, so remove them in dependency order inside a
-  // transaction before deleting the estate itself.
-  await db.transaction(async (tx) => {
-    const groupIds = tx
-      .select({ id: workGroupsTable.id })
-      .from(workGroupsTable)
-      .where(eq(workGroupsTable.estateId, id));
-    const cropIds = tx
-      .select({ id: cropsTable.id })
-      .from(cropsTable)
-      .where(eq(cropsTable.estateId, id));
-    const workerIds = tx
-      .select({ id: workersTable.id })
-      .from(workersTable)
-      .where(eq(workersTable.estateId, id));
-    const loanIds = tx
-      .select({ id: loansTable.id })
-      .from(loansTable)
-      .where(eq(loansTable.estateId, id));
-
-    // Attendance references both the estate's groups and its workers.
-    await tx.delete(attendanceTable).where(inArray(attendanceTable.workGroupId, groupIds));
-    await tx.delete(attendanceTable).where(inArray(attendanceTable.workerId, workerIds));
-    await tx.delete(dailyWorkTable).where(inArray(dailyWorkTable.workGroupId, groupIds));
-    await tx
-      .delete(groupAdvancePaymentsTable)
-      .where(inArray(groupAdvancePaymentsTable.workGroupId, groupIds));
-    await tx
-      .delete(groupWorkSessionsTable)
-      .where(inArray(groupWorkSessionsTable.workGroupId, groupIds));
-    // Loans chain: payments -> loans -> workers. Detach any stray loans that
-    // point at this estate's groups first, then delete the estate's own loans.
-    await tx.delete(loanPaymentsTable).where(inArray(loanPaymentsTable.loanId, loanIds));
-    await tx
-      .update(loansTable)
-      .set({ workGroupId: null })
-      .where(inArray(loansTable.workGroupId, groupIds));
-    await tx.delete(loansTable).where(eq(loansTable.estateId, id));
-    // Harvests reference work groups, so they must go before the groups do.
-    await tx.delete(harvestsTable).where(eq(harvestsTable.estateId, id));
-    await tx.delete(workGroupsTable).where(eq(workGroupsTable.estateId, id));
-    await tx.delete(workersTable).where(eq(workersTable.estateId, id));
-
-    await tx.delete(blocksTable).where(inArray(blocksTable.cropId, cropIds));
-    await tx.delete(spraysTable).where(eq(spraysTable.estateId, id));
-    await tx.delete(expensesTable).where(eq(expensesTable.estateId, id));
-    await tx.delete(estateUpdatesTable).where(eq(estateUpdatesTable.estateId, id));
-    await tx.delete(cropsTable).where(eq(cropsTable.estateId, id));
-
-    // Per-estate mandi price cache rows also reference the estate.
-    await tx.delete(mandiDailyPricesTable).where(eq(mandiDailyPricesTable.estateId, id));
-    await tx.delete(mandiFetchLogTable).where(eq(mandiFetchLogTable.estateId, id));
-
-    await tx.delete(farmProfileTable).where(eq(farmProfileTable.id, id));
-  });
+  await db.transaction((tx) => deleteEstateData(tx, id));
   return res.status(204).end();
 });
 
@@ -4208,7 +4154,7 @@ async function ensureMandiFetch(eid: number | null, day: string, force = false):
 
 // The day's prices (auto-fetching them on the first request each morning).
 // ?q= filters by crop or seller name — "coffee" shows every coffee quote.
-router.get("/mandi/prices", async (req, res) => {
+router.get("/mandi/prices", requireActiveSubscription, async (req, res) => {
   const { q } = req.query as Record<string, string>;
   const day = todayIsoIST();
   const eid = await activeEstateId(req);
@@ -4249,7 +4195,7 @@ router.get("/mandi/prices", async (req, res) => {
 
 // Manual "check again" — re-runs the AI search for today (e.g. after an error,
 // or later in the day when curing works update their boards).
-router.post("/mandi/refresh", async (req, res) => {
+router.post("/mandi/refresh", requireActiveSubscription, async (req, res) => {
   const day = todayIsoIST();
   const eid = await activeEstateId(req);
   const status = await ensureMandiFetch(eid, day, true);
@@ -4270,8 +4216,11 @@ async function morningMandiSweep(): Promise<void> {
   if (istHour() < MANDI_MARKET_OPEN_HOUR_IST) return;
   const day = todayIsoIST();
   try {
-    const estates = await db.select({ id: farmProfileTable.id }).from(farmProfileTable);
+    const estates = await db.select({ id: farmProfileTable.id, ownerId: farmProfileTable.ownerId }).from(farmProfileTable);
     for (const e of estates) {
+      // Mandi prices are a paid feature, and each fetch costs an AI search -
+      // only fetch for farms whose owner has an active plan.
+      if (!e.ownerId || !(await isSubscriptionActive(e.ownerId))) continue;
       // ensureMandiFetch is idempotent per estate+day — done/pending days are skipped.
       await ensureMandiFetch(e.id, day);
     }
