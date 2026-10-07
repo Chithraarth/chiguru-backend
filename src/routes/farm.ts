@@ -34,7 +34,6 @@ import { eq, and, or, gte, lte, lt, sql, desc, inArray, isNull, isNotNull } from
 import type { PgColumn } from "drizzle-orm/pg-core";
 import { requireOwner, requireOwnerOrManager, effectiveOwnerId, resolveActiveEstateId } from "../middlewares/firebaseAuth";
 import { requireActiveSubscription } from "../middlewares/subscriptionGate";
-import { isAdmin } from "../middlewares/requireAdmin";
 import { getMaxEstates, isSubscriptionActive } from "../services/entitlement.service";
 import { deleteEstateData } from "../services/account-deletion.service";
 
@@ -3686,11 +3685,9 @@ router.delete("/bin/:type/:id", async (req, res) => {
 router.get("/nursery/vendors", async (req, res) => {
   const { all, type } = req.query as { all?: string; type?: string };
   const vendorType = type === "supplies" ? "supplies" : "nursery";
-  // Pending/rejected shops and moderation notes are for Chiguru admins only.
-  const admin = isAdmin(req);
-  const baseConditions = all === "true" && admin
-    ? [eq(nurseryVendorsTable.type, vendorType)]
-    : [eq(nurseryVendorsTable.status, "approved"), eq(nurseryVendorsTable.type, vendorType)];
+  // Only live (approved) shops are listed; there is no moderation queue.
+  void all;
+  const baseConditions = [eq(nurseryVendorsTable.status, "approved"), eq(nurseryVendorsTable.type, vendorType)];
   const vendors = await db
     .select({
       id: nurseryVendorsTable.id,
@@ -3724,7 +3721,7 @@ router.get("/nursery/vendors", async (req, res) => {
       desc(nurseryVendorsTable.createdAt),
     );
   return res.json(
-    vendors.map(({ adminNotes, ...v }) => ({ ...v, ...(admin ? { adminNotes } : {}), avgRating: Number(v.avgRating) })),
+    vendors.map(({ adminNotes: _notes, ...v }) => ({ ...v, avgRating: Number(v.avgRating) })),
   );
 });
 
@@ -3737,7 +3734,25 @@ router.post("/nursery/vendors", requireOwner, requireActiveSubscription, async (
   // Registering device's per-device secret so only it can manage this shop's
   // listings later. Sanitized (capped) and never echoed back to any client.
   const ownerKey = bodyOwnerKey(req.body?.ownerKey);
-  const [row] = await db.insert(nurseryVendorsTable).values({ ...req.body, type, ownerKey }).returning();
+  // Only the shop's own details are taken from the request (never status,
+  // admin notes or ids). Shops go live immediately - there is no approval step.
+  const b = req.body as Record<string, unknown>;
+  const opt = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : null);
+  const [row] = await db
+    .insert(nurseryVendorsTable)
+    .values({
+      name: String(name).trim(),
+      phone: String(phone).trim(),
+      location: String(location).trim(),
+      photoUrl: String(photoUrl).trim(),
+      whatsapp: opt(b.whatsapp),
+      description: opt(b.description),
+      speciality: opt(b.speciality),
+      type,
+      ownerKey,
+      status: "approved",
+    })
+    .returning();
   const { ownerKey: _ok, ...publicVendor } = row;
   return res.status(201).json(publicVendor);
 });
@@ -3760,8 +3775,8 @@ router.get("/nursery/vendors/:id", async (req, res) => {
     ? Math.round((ratings.reduce((s, r) => s + r.rating, 0) / ratingCount) * 10) / 10
     : 0;
   // Never expose the vendor's owner secret to any client.
-  const { ownerKey: _ok, adminNotes, ...publicVendor } = vendor;
-  return res.json({ ...publicVendor, ...(isAdmin(req) ? { adminNotes } : {}), listings, ratings, avgRating, ratingCount });
+  const { ownerKey: _ok, adminNotes: _notes, ...publicVendor } = vendor;
+  return res.json({ ...publicVendor, listings, ratings, avgRating, ratingCount });
 });
 
 router.post("/nursery/vendors/:id/ratings", async (req, res) => {
@@ -3779,10 +3794,8 @@ router.post("/nursery/vendors/:id/ratings", async (req, res) => {
   return res.status(201).json(row);
 });
 
-// Shop details a shop's own device may change. Approval status and admin
-// notes are moderation fields: Chiguru admins only.
-const VENDOR_SELF_FIELDS = ["name", "phone", "whatsapp", "location", "description", "speciality", "photoUrl"] as const;
-const VENDOR_ADMIN_FIELDS = [...VENDOR_SELF_FIELDS, "status", "adminNotes", "isActive"] as const;
+// Shop details its own device may change (never status or admin notes).
+const VENDOR_SELF_FIELDS: readonly string[] = ["name", "phone", "whatsapp", "location", "description", "speciality", "photoUrl", "isActive"];
 
 router.patch("/nursery/vendors/:id", async (req, res) => {
   const id = Number(req.params.id);
@@ -3790,21 +3803,18 @@ router.patch("/nursery/vendors/:id", async (req, res) => {
     .from(nurseryVendorsTable).where(eq(nurseryVendorsTable.id, id));
   if (!vendor) return res.status(404).json({ message: "Vendor not found" });
   const body = (req.body ?? {}) as Record<string, unknown>;
-  const admin = isAdmin(req);
   const bodyKey = typeof body.ownerKey === "string" ? body.ownerKey.trim() : "";
   const callerKey = bodyKey || requestOwnerKey(req);
-  const isShopOwner = !!vendor.ownerKey && callerKey === vendor.ownerKey;
-  if (!admin && !isShopOwner) return res.status(403).json({ message: "You can only edit your own shop" });
-  const allowed: readonly string[] = admin ? VENDOR_ADMIN_FIELDS : VENDOR_SELF_FIELDS;
-  const patch = Object.fromEntries(Object.entries(body).filter(([k]) => allowed.includes(k)));
+  if (!vendor.ownerKey || callerKey !== vendor.ownerKey) return res.status(403).json({ message: "You can only edit your own shop" });
+  const patch = Object.fromEntries(Object.entries(body).filter(([k]) => VENDOR_SELF_FIELDS.includes(k)));
   if (Object.keys(patch).length === 0) return res.status(400).json({ message: "Nothing to update" });
   const [row] = await db.update(nurseryVendorsTable)
     .set(patch)
     .where(eq(nurseryVendorsTable.id, Number(req.params.id)))
     .returning();
   if (!row) return res.status(404).json({ message: "Vendor not found" });
-  const { ownerKey: _ok, adminNotes, ...publicVendor } = row;
-  return res.json({ ...publicVendor, ...(admin ? { adminNotes } : {}) });
+  const { ownerKey: _ok, adminNotes: _notes, ...publicVendor } = row;
+  return res.json(publicVendor);
 });
 
 router.delete("/nursery/vendors/:id", async (req, res) => {
@@ -3813,9 +3823,9 @@ router.delete("/nursery/vendors/:id", async (req, res) => {
     .from(nurseryVendorsTable).where(eq(nurseryVendorsTable.id, id));
   // Idempotent for offline retries.
   if (!vendor) return res.status(204).send();
-  // Only the shop's own device or a Chiguru admin may remove it. Legacy
-  // (null-key) shops have no owning device, so they are admin-only.
-  if (!isAdmin(req)) {
+  // Only the shop's own device may remove it; legacy (null-key) shops have
+  // no owning device, so nobody can.
+  {
     const b = (req.body ?? {}) as Record<string, unknown>;
     const bodyKey = typeof b.ownerKey === "string" ? b.ownerKey.trim() : "";
     const callerKey = bodyKey || requestOwnerKey(req);
@@ -3898,8 +3908,8 @@ async function canMutateNurseryListing(
     .select({ ownerKey: nurseryVendorsTable.ownerKey })
     .from(nurseryVendorsTable)
     .where(eq(nurseryVendorsTable.id, listing.vendorId));
-  // Legacy (null-key) shops have no owning device: only admins may change them.
-  if (!vendor?.ownerKey) return isAdmin(req as Request) ? { ok: true } : { ok: false };
+  // Legacy (null-key) shops have no owning device, so nobody may change them.
+  if (!vendor?.ownerKey) return { ok: false };
   const b = (req.body ?? {}) as Record<string, unknown>;
   const bodyKey = typeof b.ownerKey === "string" ? b.ownerKey.trim() : "";
   const callerKey = bodyKey || requestOwnerKey(req);

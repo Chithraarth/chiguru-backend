@@ -470,6 +470,9 @@ export const consultationMessagesTable = pgTable("consultation_messages", {
 // (agri-doctor consultation wallet, manager-device/estate add-ons). Do NOT
 // query this table without filtering by ownerId.
 export const appSettingsTable = pgTable("app_settings", {
+  // When this account unlocked every Agri Doctor's contact number (one-time
+  // wallet fee). Null = numbers hidden.
+  doctorContactsUnlockedAt: timestamp("doctor_contacts_unlocked_at", { withTimezone: true }),
   id: serial("id").primaryKey(),
   ownerId: integer("owner_id").notNull().references(() => ownersTable.id).unique(),
   trialStartDate: timestamp("trial_start_date").notNull().defaultNow(),

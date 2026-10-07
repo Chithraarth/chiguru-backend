@@ -130,18 +130,18 @@ export async function chargeAI(ownerId: number, feature: string): Promise<{ bala
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
 /**
- * Takes up to `amount` from the wallet inside the caller's transaction and
- * returns how much was actually taken (never more than the balance, which
- * never goes below 0). Used where the price is only known afterwards, e.g. an
- * Agri Doctor consultation billed by the minute.
+ * Charges exactly `amount` from the wallet inside the caller's transaction,
+ * or throws WALLET_EMPTY (402) without charging anything when the balance is
+ * short. Used for one-off purchases paid from the wallet, e.g. unlocking
+ * Agri Doctor contact numbers.
  */
-export async function debitWalletUpTo(
+export async function chargeWalletInTx(
   tx: Tx,
   ownerId: number,
   amount: number,
   type: string,
   feature: string,
-): Promise<{ charged: number; balance: number }> {
+): Promise<{ balance: number }> {
   let [row] = await tx
     .select()
     .from(walletBalancesTable)
@@ -150,16 +150,13 @@ export async function debitWalletUpTo(
     .for("update");
   if (!row) [row] = await tx.insert(walletBalancesTable).values({ ownerId }).returning();
   const balance = Number(row.balance || 0);
-  const charged = Math.round(Math.min(Math.max(0, amount), balance) * 100) / 100;
-  const newBalance = Math.round((balance - charged) * 100) / 100;
-  if (charged > 0) {
-    await tx
-      .update(walletBalancesTable)
-      .set({ balance: String(newBalance), updatedAt: new Date() })
-      .where(eq(walletBalancesTable.id, row.id));
-    await tx.insert(walletTransactionsTable).values({ ownerId, type, feature, amount: String(-charged) });
+  if (balance < amount) {
+    throw new WalletError("WALLET_EMPTY", `Your wallet needs ₹${amount} for this. Recharge your wallet to continue.`, balance, amount);
   }
-  return { charged, balance: newBalance };
+  const newBalance = Math.round((balance - amount) * 100) / 100;
+  await tx.update(walletBalancesTable).set({ balance: String(newBalance), updatedAt: new Date() }).where(eq(walletBalancesTable.id, row.id));
+  await tx.insert(walletTransactionsTable).values({ ownerId, type, feature, amount: String(-amount) });
+  return { balance: newBalance };
 }
 
 /**
