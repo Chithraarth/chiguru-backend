@@ -28,7 +28,9 @@ import {
   canUseAgriDoctor,
   canUseManagerDevices,
 } from "../lib/subscription";
-import { requireOwner, effectiveOwnerId } from "../middlewares/firebaseAuth";
+import { requireOwner, effectiveOwnerId, resolveActiveEstateId } from "../middlewares/firebaseAuth";
+import { requireAdmin } from "../middlewares/requireAdmin";
+import { getWalletState, debitWalletUpTo } from "../lib/wallet";
 import { requireActiveSubscription } from "../middlewares/subscriptionGate";
 
 const router = Router();
@@ -82,6 +84,7 @@ function publicDoctor(d: AgronomistRow) {
     upiId: _u,
     panNumber: _p,
     paidOut: _po,
+    totalEarnings: _te,
     ...safe
   } = d;
   return { ...safe, payoutReady: hasPayoutDetails(d) };
@@ -299,7 +302,8 @@ router.post("/agronomists", requireOwner, requireActiveSubscription, async (req,
 // A doctor's own earnings view: how much they've earned (80% share), how much
 // has been paid out, how much is pending, and what's still available to
 // withdraw — plus their (masked) payout channel and payout history.
-router.get("/agronomists/:id/earnings", async (req, res) => {
+// Earnings, payout details and payout history: Chiguru admins only.
+router.get("/agronomists/:id/earnings", requireOwner, requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   const rows = await db.select().from(agronomistsTable).where(eq(agronomistsTable.id, id)).limit(1);
   if (rows.length === 0) return res.status(404).json({ error: "Agronomist not found" });
@@ -340,7 +344,7 @@ router.get("/agronomists/:id/earnings", async (req, res) => {
 // Request a payout of the doctor's available balance (or a chosen amount).
 // Creates a `pending` ledger entry; it is disbursed later via the mark-paid
 // endpoint.
-router.post("/agronomists/:id/payouts", async (req, res) => {
+router.post("/agronomists/:id/payouts", requireOwner, requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   const b = req.body as Record<string, unknown>;
   const reference = typeof b.reference === "string" && b.reference.trim() ? b.reference.trim() : null;
@@ -393,7 +397,7 @@ router.post("/agronomists/:id/payouts", async (req, res) => {
 
 // Mark a pending payout as paid — records the disbursement and adds the amount
 // to the doctor's running `paidOut` total (atomically).
-router.post("/agronomists/:id/payouts/:payoutId/paid", async (req, res) => {
+router.post("/agronomists/:id/payouts/:payoutId/paid", requireOwner, requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   const payoutId = Number(req.params.payoutId);
   const b = req.body as Record<string, unknown>;
@@ -471,6 +475,8 @@ router.get("/app-settings", requireOwner, async (req, res) => {
     isSubscribed,
     canSell: await canSell(ownerId),
     canUseAgriDoctor: await canUseAgriDoctor(ownerId),
+    // The one Chiguru wallet (not the retired app_settings balance).
+    walletBalance: (await getWalletState(ownerId)).balance,
     canUseManagerDevices: await canUseManagerDevices(ownerId),
     managerDeviceAddonActive: isManagerDeviceAddonActive(settings, now),
     extraEstates,
@@ -480,19 +486,14 @@ router.get("/app-settings", requireOwner, async (req, res) => {
   });
 });
 
-router.post("/app-settings/wallet/topup", requireOwner, async (req, res) => {
-  const ownerId = effectiveOwnerId(req)!;
-  const { amount } = req.body as { amount?: number };
-  const amt = Number(amount);
-  if (!amt || amt <= 0) return res.status(400).json({ error: "amount must be greater than 0" });
-  const settings = await getSettings(ownerId);
-  const newBalance = (Number(settings.walletBalance) || 0) + amt;
-  const [row] = await db
-    .update(appSettingsTable)
-    .set({ walletBalance: String(newBalance) })
-    .where(eq(appSettingsTable.id, settings.id))
-    .returning();
-  return res.json(row);
+// Retired: this used to add any amount to a separate Agri Doctor balance
+// without taking a payment. Consultations now use the Chiguru wallet, which is
+// only recharged through verified Razorpay / Apple / Google payments.
+router.post("/app-settings/wallet/topup", requireOwner, (_req, res) => {
+  res.status(410).json({
+    error: "Recharge your Chiguru wallet from the Wallet screen to pay for consultations.",
+    code: "USE_WALLET_RECHARGE",
+  });
 });
 
 // Premium planters (Gold/Platinum, or in-trial) can register interest in the
@@ -613,6 +614,21 @@ router.post("/consultations", requireOwner, requireActiveSubscription, async (re
     return res.status(403).json({ error: "This doctor has not completed their payout setup yet and cannot consult online" });
   }
 
+  // Consultations are paid from the Chiguru wallet (the same one recharged
+  // through Razorpay / Apple / Google). Starting needs at least the first
+  // 15-minute block, so a call is never free for the farmer while the doctor
+  // still earns from it.
+  const firstBlock = Number(doc.ratePer15Min) || 0;
+  const { balance } = await getWalletState(effectiveOwnerId(req)!);
+  if (firstBlock > 0 && balance < firstBlock) {
+    return res.status(402).json({
+      error: `Your wallet needs at least ₹${firstBlock} to start a consultation. Recharge your wallet to continue.`,
+      code: "WALLET_EMPTY",
+      balance,
+      price: firstBlock,
+    });
+  }
+
   const [consultation] = await db
     .insert(consultationsTable)
     .values({ ownerId: effectiveOwnerId(req)!, agronomistId: Number(agronomistId), mode: mode === "call" ? "call" : "chat", topic: topic ?? null })
@@ -686,7 +702,9 @@ router.post("/consultations/:id/messages", requireOwner, async (req, res) => {
     .where(eq(consultationMessagesTable.consultationId, id))
     .orderBy(asc(consultationMessagesTable.createdAt));
 
-  const profile = await db.select().from(farmProfileTable).limit(1);
+  // The farmer's own active farm (not whichever farm happens to be first).
+  const activeEid = await resolveActiveEstateId(req);
+  const profile = activeEid == null ? [] : await db.select().from(farmProfileTable).where(eq(farmProfileTable.id, activeEid)).limit(1);
   const farmContext = profile.length
     ? `The farmer's farm: ${profile[0].farmName ?? "farm"} in ${profile[0].village ?? ""}, ${profile[0].district ?? ""}, about ${profile[0].totalAcres ?? "?"} acres.`
     : "";
@@ -737,14 +755,13 @@ router.post("/consultations/:id/end", requireOwner, async (req, res) => {
 
   // Idempotent: if already ended, return stored result without re-charging.
   if (consultation.status === "ended") {
-    const s = await getSettings(consultation.ownerId);
     return res.json({
       ...consultation,
       cost: Number(consultation.cost),
       doctorEarning: Number(consultation.doctorEarning),
       platformFee: Number(consultation.platformFee),
       minutes: consultation.durationMinutes,
-      walletBalance: Number(s.walletBalance) || 0,
+      walletBalance: (await getWalletState(consultation.ownerId)).balance,
       alreadyEnded: true,
     });
   }
@@ -759,8 +776,7 @@ router.post("/consultations/:id/end", requireOwner, async (req, res) => {
   const blocks = Math.max(1, Math.ceil(elapsedSec / (15 * 60)));
   // Normalize the charge to paise before splitting so the returned cost always
   // equals doctorEarning + platformFee exactly (no float artifacts).
-  const cost = Math.round(blocks * ratePer15 * 100) / 100;
-  const { doctorEarning, platformFee } = splitRevenue(cost);
+  const fullCost = Math.round(blocks * ratePer15 * 100) / 100;
 
   const settings = await getSettings(consultation.ownerId);
 
@@ -769,33 +785,37 @@ router.post("/consultations/:id/end", requireOwner, async (req, res) => {
   // earnings out of sync. Running totals use in-SQL increments (`col = col + x`)
   // to avoid lost updates when consultations end concurrently.
   let updated: typeof consultationsTable.$inferSelect | undefined;
-  let newBalance = Number(settings.walletBalance) || 0;
+  let newBalance = 0;
+  let cost = 0;
+  let doctorEarning = 0;
+  let platformFee = 0;
   await db.transaction(async (tx) => {
-    const [row] = await tx
+    // Claim the consultation first so a concurrent end can't charge twice.
+    const [claimed] = await tx
       .update(consultationsTable)
-      .set({
-        status: "ended",
-        endedAt: new Date(),
-        durationMinutes: minutes,
-        cost: String(cost),
-        doctorEarning: String(doctorEarning),
-        platformFee: String(platformFee),
-      })
+      .set({ status: "ended", endedAt: new Date(), durationMinutes: minutes })
       .where(and(eq(consultationsTable.id, id), eq(consultationsTable.status, "active")))
       .returning();
-    updated = row;
     // Lost the race (another request ended it first) — do not charge or credit.
-    if (!row) return;
+    if (!claimed) return;
 
-    const [s] = await tx
-      .update(appSettingsTable)
-      .set({
-        walletBalance: sql`GREATEST(0, ${appSettingsTable.walletBalance} - ${cost})`,
-        platformRevenue: sql`${appSettingsTable.platformRevenue} + ${platformFee}`,
-      })
-      .where(eq(appSettingsTable.id, settings.id))
+    // Charge the wallet; if a long call ran past the balance, only what was
+    // actually collected is split, so the doctor is never owed more than the
+    // farmer paid.
+    const debit = await debitWalletUpTo(tx, consultation.ownerId, fullCost, "consultation", "agri_doctor");
+    newBalance = debit.balance;
+    cost = debit.charged;
+    ({ doctorEarning, platformFee } = splitRevenue(cost));
+    [updated] = await tx
+      .update(consultationsTable)
+      .set({ cost: String(cost), doctorEarning: String(doctorEarning), platformFee: String(platformFee) })
+      .where(eq(consultationsTable.id, id))
       .returning();
-    newBalance = Number(s?.walletBalance) || 0;
+
+    await tx
+      .update(appSettingsTable)
+      .set({ platformRevenue: sql`${appSettingsTable.platformRevenue} + ${platformFee}` })
+      .where(eq(appSettingsTable.id, settings.id));
 
     if (docRows.length) {
       await tx
@@ -807,14 +827,13 @@ router.post("/consultations/:id/end", requireOwner, async (req, res) => {
 
   if (!updated) {
     const fresh = await db.select().from(consultationsTable).where(eq(consultationsTable.id, id)).limit(1);
-    const s = await getSettings(consultation.ownerId);
     return res.json({
       ...fresh[0],
       cost: Number(fresh[0]?.cost) || 0,
       doctorEarning: Number(fresh[0]?.doctorEarning) || 0,
       platformFee: Number(fresh[0]?.platformFee) || 0,
       minutes: fresh[0]?.durationMinutes ?? 0,
-      walletBalance: Number(s.walletBalance) || 0,
+      walletBalance: (await getWalletState(consultation.ownerId)).balance,
       alreadyEnded: true,
     });
   }

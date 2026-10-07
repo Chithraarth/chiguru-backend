@@ -637,6 +637,8 @@ export type InsertHireListing = z.infer<typeof insertHireListingSchema>;
 // so the diagnosis quality can be reviewed and improved over time.
 export const diseaseDiagnosesTable = pgTable("disease_diagnoses", {
   id: serial("id").primaryKey(),
+  // Who ran the check; only they can record whether the advice helped.
+  ownerId: integer("owner_id"),
   cropType: text("crop_type"),
   // The analyzed photo (base64 data URL). Nullable: very large photos are skipped
   // server-side to avoid bloating the DB, but the diagnosis row is still kept.

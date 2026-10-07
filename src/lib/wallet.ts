@@ -127,6 +127,41 @@ export async function chargeAI(ownerId: number, feature: string): Promise<{ bala
   });
 }
 
+type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/**
+ * Takes up to `amount` from the wallet inside the caller's transaction and
+ * returns how much was actually taken (never more than the balance, which
+ * never goes below 0). Used where the price is only known afterwards, e.g. an
+ * Agri Doctor consultation billed by the minute.
+ */
+export async function debitWalletUpTo(
+  tx: Tx,
+  ownerId: number,
+  amount: number,
+  type: string,
+  feature: string,
+): Promise<{ charged: number; balance: number }> {
+  let [row] = await tx
+    .select()
+    .from(walletBalancesTable)
+    .where(eq(walletBalancesTable.ownerId, ownerId))
+    .limit(1)
+    .for("update");
+  if (!row) [row] = await tx.insert(walletBalancesTable).values({ ownerId }).returning();
+  const balance = Number(row.balance || 0);
+  const charged = Math.round(Math.min(Math.max(0, amount), balance) * 100) / 100;
+  const newBalance = Math.round((balance - charged) * 100) / 100;
+  if (charged > 0) {
+    await tx
+      .update(walletBalancesTable)
+      .set({ balance: String(newBalance), updatedAt: new Date() })
+      .where(eq(walletBalancesTable.id, row.id));
+    await tx.insert(walletTransactionsTable).values({ ownerId, type, feature, amount: String(-charged) });
+  }
+  return { charged, balance: newBalance };
+}
+
 /**
  * Route helper: pre-check credit and answer 402 when the wallet is too low.
  * Returns false when the response was already sent (route should return).

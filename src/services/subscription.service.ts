@@ -219,6 +219,15 @@ export async function verifyAndActivateGooglePlay(
     logger.info({ err, ownerId }, "Google Play acknowledge skipped (likely already acknowledged)");
   }
 
+  // One Google Play purchase can't unlock two Chiguru accounts.
+  const [linked] = await db
+    .select({ ownerId: subscriptionsTable.ownerId })
+    .from(subscriptionsTable)
+    .where(eq(subscriptionsTable.providerSubscriptionId, params.purchaseToken));
+  if (linked && linked.ownerId !== ownerId) {
+    throw new SubscriptionServiceError(409, "GOOGLE_PLAY_SUBSCRIPTION_IN_USE", "This Google Play subscription is already linked to another Chiguru account.");
+  }
+
   const existing = await getCurrentSubscription(ownerId);
   const isSameSubscription = existing?.providerSubscriptionId === params.purchaseToken;
 

@@ -22,7 +22,7 @@ import {
   handleGooglePlayNotification,
   SubscriptionServiceError,
 } from "../services/subscription.service";
-import { verifyWebhookSignature, createOneTimeOrder, verifyOrderPaymentSignature, RAZORPAY_KEY_ID } from "../lib/razorpay";
+import { verifyWebhookSignature, createOneTimeOrder, confirmOneTimePayment, OneTimePaymentError, RAZORPAY_KEY_ID } from "../lib/razorpay";
 import { logger } from "../lib/logger";
 import { verifyAppleTransaction, applePaymentKey, APPLE_SEAT_PRODUCT_ID, AppleVerificationError } from "../lib/apple";
 
@@ -121,13 +121,27 @@ router.post("/subscriptions/manager-seat-addon/verify", requireOwner, async (req
     res.status(400).json({ message: "orderId, paymentId and signature are required", code: "INVALID_REQUEST" });
     return;
   }
-  const valid = verifyOrderPaymentSignature(orderId, paymentId, signature);
-  if (!valid) {
-    res.status(400).json({ message: "Payment verification failed", code: "VERIFICATION_FAILED" });
-    return;
+  try {
+    const { amountRupees } = await confirmOneTimePayment({
+      orderId, paymentId, signature, ownerId: req.owner!.id, purpose: "manager_seat_addon",
+    });
+    if (amountRupees < MANAGER_SEAT_ADDON_PRICE) {
+      res.status(400).json({ message: "This payment doesn't cover an invitee seat.", code: "ORDER_MISMATCH" });
+      return;
+    }
+  } catch (err) {
+    if (err instanceof OneTimePaymentError) {
+      res.status(400).json({ message: err.message, code: err.code });
+      return;
+    }
+    throw err;
   }
 
   const result = await grantManagerSeat(req.owner!.id, "RAZORPAY", paymentId);
+  if ("conflict" in result) {
+    res.status(409).json({ message: "This payment was already used on another account.", code: "PURCHASE_ALREADY_USED" });
+    return;
+  }
   res.json({ ok: true, ...result });
 });
 
