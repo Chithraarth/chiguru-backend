@@ -2,11 +2,11 @@ import type { NextFunction, Request, Response } from "express";
 import { Router } from "express";
 import { db } from "../db";
 import { conversations, messages, farmProfileTable, cropsTable, expensesTable, spraysTable, harvestsTable, diseaseDiagnosesTable } from "../db";
-import { eq, asc, gte } from "drizzle-orm";
+import { eq, asc, gte, and } from "drizzle-orm";
 import { geminiAnalyzeImage, geminiChat, geminiChatStream, type ChatTurn, Type, GEMINI_PRO_MODEL } from "../integrations-gemini-ai-server";
 import { CROP_DISEASE_KNOWLEDGE } from "../lib/crop-diseases";
 import { requireActiveSubscription } from "../middlewares/subscriptionGate";
-import { effectiveOwnerId } from "../middlewares/firebaseAuth";
+import { effectiveOwnerId, resolveActiveEstateId } from "../middlewares/firebaseAuth";
 import { ensureAICredit, chargeAISafe } from "../lib/wallet";
 
 const router = Router();
@@ -19,23 +19,47 @@ function requireWalletCredit(feature: string) {
   };
 }
 
+/** The signed-in person's active farm and its crops — never another farm's data. */
+async function farmFor(req: Request) {
+  const eid = await resolveActiveEstateId(req);
+  if (eid == null) return { eid: null, profile: undefined, crops: [] as (typeof cropsTable.$inferSelect)[] };
+  const [profile, crops] = await Promise.all([
+    db.select().from(farmProfileTable).where(eq(farmProfileTable.id, eid)).limit(1).then((r) => r[0]),
+    db.select().from(cropsTable).where(eq(cropsTable.estateId, eid)),
+  ]);
+  return { eid, profile, crops };
+}
+
+/** A chat belongs to the person who started it; anyone else gets "not found". */
+async function ownConversation(req: Request, id: number) {
+  const [conv] = await db
+    .select()
+    .from(conversations)
+    .where(and(eq(conversations.id, id), eq(conversations.ownerId, req.owner!.id)));
+  return conv;
+}
+
 // ──────────────────────────────────────────────
 // Conversations CRUD
 // ──────────────────────────────────────────────
-router.get("/openai/conversations", async (_req, res) => {
-  const rows = await db.select().from(conversations).orderBy(asc(conversations.createdAt));
+router.get("/openai/conversations", async (req, res) => {
+  const rows = await db
+    .select()
+    .from(conversations)
+    .where(eq(conversations.ownerId, req.owner!.id))
+    .orderBy(asc(conversations.createdAt));
   res.json(rows);
 });
 
 router.post("/openai/conversations", async (req, res) => {
   const { title } = req.body as { title?: string };
-  const [row] = await db.insert(conversations).values({ title: title ?? "New conversation" }).returning();
+  const [row] = await db.insert(conversations).values({ title: title ?? "New conversation", ownerId: req.owner!.id }).returning();
   res.status(201).json(row);
 });
 
 router.get("/openai/conversations/:id", async (req, res) => {
   const id = parseInt(req.params.id);
-  const [conv] = await db.select().from(conversations).where(eq(conversations.id, id));
+  const conv = await ownConversation(req, id);
   if (!conv) { res.status(404).json({ error: "Not found" }); return; }
   const msgs = await db.select().from(messages).where(eq(messages.conversationId, id)).orderBy(asc(messages.createdAt));
   res.json({ ...conv, messages: msgs });
@@ -43,7 +67,7 @@ router.get("/openai/conversations/:id", async (req, res) => {
 
 router.delete("/openai/conversations/:id", async (req, res) => {
   const id = parseInt(req.params.id);
-  const [conv] = await db.select().from(conversations).where(eq(conversations.id, id));
+  const conv = await ownConversation(req, id);
   if (!conv) { res.status(404).json({ error: "Not found" }); return; }
   await db.delete(conversations).where(eq(conversations.id, id));
   res.status(204).end();
@@ -51,6 +75,7 @@ router.delete("/openai/conversations/:id", async (req, res) => {
 
 router.get("/openai/conversations/:id/messages", async (req, res) => {
   const id = parseInt(req.params.id);
+  if (!(await ownConversation(req, id))) { res.status(404).json({ error: "Not found" }); return; }
   const msgs = await db.select().from(messages).where(eq(messages.conversationId, id)).orderBy(asc(messages.createdAt));
   res.json(msgs);
 });
@@ -62,15 +87,14 @@ router.post<{ id: string }>("/openai/conversations/:id/messages", requireActiveS
   const id = parseInt(req.params.id);
   const { content } = req.body as { content: string };
 
-  const [conv] = await db.select().from(conversations).where(eq(conversations.id, id));
+  const conv = await ownConversation(req, id);
   if (!conv) { res.status(404).json({ error: "Not found" }); return; }
 
   await db.insert(messages).values({ conversationId: id, role: "user", content });
 
-  const [history, profile, crops] = await Promise.all([
+  const [history, { eid, profile, crops }] = await Promise.all([
     db.select().from(messages).where(eq(messages.conversationId, id)).orderBy(asc(messages.createdAt)),
-    db.select().from(farmProfileTable).limit(1).then((r) => r[0]),
-    db.select().from(cropsTable),
+    farmFor(req),
   ]);
 
   // Last 30 days context
@@ -79,9 +103,9 @@ router.post<{ id: string }>("/openai/conversations/:id/messages", requireActiveS
   const cutoff = thirtyDaysAgo.toISOString().slice(0, 10);
 
   const [recentExpenses, recentSprays, recentHarvests] = await Promise.all([
-    db.select().from(expensesTable).where(gte(expensesTable.date, cutoff)),
-    db.select().from(spraysTable).where(gte(spraysTable.date, cutoff)),
-    db.select().from(harvestsTable).where(gte(harvestsTable.date, cutoff)),
+    eid == null ? [] : db.select().from(expensesTable).where(and(eq(expensesTable.estateId, eid), gte(expensesTable.date, cutoff))),
+    eid == null ? [] : db.select().from(spraysTable).where(and(eq(spraysTable.estateId, eid), gte(spraysTable.date, cutoff))),
+    eid == null ? [] : db.select().from(harvestsTable).where(and(eq(harvestsTable.estateId, eid), gte(harvestsTable.date, cutoff))),
   ]);
 
   const farmContext = profile
@@ -146,19 +170,16 @@ router.post("/ai/chat", requireActiveSubscription, requireWalletCredit("ai_chat"
 
   if (!message) { res.status(400).json({ error: "message is required" }); return; }
 
-  const [profile, crops] = await Promise.all([
-    db.select().from(farmProfileTable).limit(1).then((r) => r[0]),
-    db.select().from(cropsTable),
-  ]);
+  const { eid, profile, crops } = await farmFor(req);
 
   const thirtyDaysAgo = new Date();
   thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
   const cutoff = thirtyDaysAgo.toISOString().slice(0, 10);
 
   const [recentExpenses, recentSprays, recentHarvests] = await Promise.all([
-    db.select().from(expensesTable).where(gte(expensesTable.date, cutoff)),
-    db.select().from(spraysTable).where(gte(spraysTable.date, cutoff)),
-    db.select().from(harvestsTable).where(gte(harvestsTable.date, cutoff)),
+    eid == null ? [] : db.select().from(expensesTable).where(and(eq(expensesTable.estateId, eid), gte(expensesTable.date, cutoff))),
+    eid == null ? [] : db.select().from(spraysTable).where(and(eq(spraysTable.estateId, eid), gte(spraysTable.date, cutoff))),
+    eid == null ? [] : db.select().from(harvestsTable).where(and(eq(harvestsTable.estateId, eid), gte(harvestsTable.date, cutoff))),
   ]);
 
   const farmContext = profile
@@ -217,10 +238,7 @@ router.post("/ai/disease", requireActiveSubscription, requireWalletCredit("disea
 
   if (!imageBase64) { res.status(400).json({ error: "imageBase64 is required" }); return; }
 
-  const [profile, crops] = await Promise.all([
-    db.select().from(farmProfileTable).limit(1).then((r) => r[0]),
-    db.select().from(cropsTable),
-  ]);
+  const { eid, profile, crops } = await farmFor(req);
 
   const farmCrops = crops.map((c) => c.name).join(", ") || "unknown";
   const targetCrop = cropType ?? "unknown (please identify from photo)";
@@ -340,6 +358,7 @@ ${CROP_DISEASE_KNOWLEDGE}`;
       const [row] = await db
         .insert(diseaseDiagnosesTable)
         .values({
+          ownerId: req.owner?.id ?? null,
           cropType: cropType ?? null,
           photoUrl: dataUrl.length <= PHOTO_MAX ? dataUrl : null,
           diseaseName: String(parsed.diseaseName ?? "Unknown"),
@@ -377,7 +396,7 @@ router.patch("/ai/disease/:id/outcome", async (req, res) => {
   const [row] = await db
     .update(diseaseDiagnosesTable)
     .set({ outcome, outcomeNote: outcomeNote ?? null })
-    .where(eq(diseaseDiagnosesTable.id, id))
+    .where(and(eq(diseaseDiagnosesTable.id, id), eq(diseaseDiagnosesTable.ownerId, req.owner!.id)))
     .returning({ id: diseaseDiagnosesTable.id });
   if (!row) { res.status(404).json({ error: "Diagnosis not found" }); return; }
   res.json({ ok: true });

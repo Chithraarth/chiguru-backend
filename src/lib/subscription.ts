@@ -160,9 +160,9 @@ export function isSubscriptionActive(s: SettingsRow, now: Date = new Date()): bo
 // this file's own legacy app_settings.subscriptionPlan, which nothing writes
 // to anymore since the app moved off the old single-tier Farmer plan.
 export async function canUseAgriDoctor(ownerId: number): Promise<boolean> {
-  const s = await getAppSettingsRow(ownerId);
-  const { trialActive } = getTrial(new Date(s.trialStartDate as unknown as string));
-  return trialActive || isSubscriptionActive(s) || (await isRealSubscriptionActive(ownerId));
+  // Only a real, paid subscription (subscriptions table) counts - not the
+  // retired app_settings plan, which could be set without paying.
+  return isRealSubscriptionActive(ownerId);
 }
 
 // Selling (Farmers Market produce, opening a Nursery/Supplies shop and listing
@@ -170,9 +170,9 @@ export async function canUseAgriDoctor(ownerId: number): Promise<boolean> {
 // trial, and afterwards with any active Basic/Premium/Pro plan — see the
 // canUseAgriDoctor comment above for why both subscription sources are checked.
 export async function canSell(ownerId: number): Promise<boolean> {
-  const s = await getAppSettingsRow(ownerId);
-  const { trialActive } = getTrial(new Date(s.trialStartDate as unknown as string));
-  return trialActive || isSubscriptionActive(s) || (await isRealSubscriptionActive(ownerId));
+  // Only a real, paid subscription (subscriptions table) counts - not the
+  // retired app_settings plan, which could be set without paying.
+  return isRealSubscriptionActive(ownerId);
 }
 
 // The "Zamindar" estate add-on permanently raises the estate allowance by one

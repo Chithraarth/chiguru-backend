@@ -1,7 +1,7 @@
 import { Router, type IRouter } from "express";
 import { requireOwner } from "../middlewares/firebaseAuth";
 import { MIN_RECHARGE_AMOUNT, AI_PRICES, getWalletState, getWalletHistory, creditWallet } from "../lib/wallet";
-import { createOneTimeOrder, verifyOrderPaymentSignature, RAZORPAY_KEY_ID } from "../lib/razorpay";
+import { createOneTimeOrder, confirmOneTimePayment, OneTimePaymentError, RAZORPAY_KEY_ID } from "../lib/razorpay";
 import { db, paymentsTable } from "../db";
 import { eq } from "drizzle-orm";
 import { verifyAppleTransaction, applePaymentKey, APPLE_WALLET_PACKS, AppleVerificationError } from "../lib/apple";
@@ -42,25 +42,36 @@ router.post("/wallet/recharge/order", requireOwner, async (req, res) => {
 
 /** Step 2 of a recharge: verify the signature Razorpay's checkout.js returns, then credit the wallet. */
 router.post("/wallet/recharge/verify", requireOwner, async (req, res) => {
-  const { orderId, paymentId, signature, amount } = req.body as {
-    orderId?: string; paymentId?: string; signature?: string; amount?: number;
-  };
-  const amt = Number(amount);
-  if (!orderId || !paymentId || !signature || !Number.isFinite(amt) || amt < MIN_RECHARGE_AMOUNT) {
-    res.status(400).json({ message: "orderId, paymentId, signature and a valid amount are required", code: "INVALID_REQUEST" });
+  // `amount` from the client is ignored: what's credited is what Razorpay
+  // says was actually paid for this Owner's recharge order.
+  const { orderId, paymentId, signature } = req.body as { orderId?: string; paymentId?: string; signature?: string };
+  if (!orderId || !paymentId || !signature) {
+    res.status(400).json({ message: "orderId, paymentId and signature are required", code: "INVALID_REQUEST" });
     return;
   }
-  const valid = verifyOrderPaymentSignature(orderId, paymentId, signature);
-  if (!valid) {
-    res.status(400).json({ message: "Payment verification failed", code: "VERIFICATION_FAILED" });
+  const ownerId = req.owner!.id;
+  let amount: number;
+  try {
+    ({ amountRupees: amount } = await confirmOneTimePayment({ orderId, paymentId, signature, ownerId, purpose: "wallet_recharge" }));
+  } catch (err) {
+    if (err instanceof OneTimePaymentError) {
+      res.status(400).json({ message: err.message, code: err.code });
+      return;
+    }
+    throw err;
+  }
+  // One payment, one credit, one Owner: the payments row is unique per
+  // Razorpay payment id across every account.
+  await db
+    .insert(paymentsTable)
+    .values({ ownerId, provider: "RAZORPAY", providerPaymentId: paymentId, amount: String(amount), paymentStatus: "succeeded", paymentDate: new Date() })
+    .onConflictDoNothing();
+  const [payment] = await db.select({ ownerId: paymentsTable.ownerId }).from(paymentsTable).where(eq(paymentsTable.providerPaymentId, paymentId));
+  if (payment && payment.ownerId !== ownerId) {
+    res.status(409).json({ message: "This payment was already used on another account.", code: "PURCHASE_ALREADY_USED" });
     return;
   }
-  const result = await creditWallet({
-    ownerId: req.owner!.id,
-    type: "recharge",
-    amount: amt,
-    clientId: paymentId, // Razorpay's payment id is already globally unique — a retried verify call can never double-credit.
-  });
+  const result = await creditWallet({ ownerId, type: "recharge", amount, clientId: paymentId });
   res.json({ ok: true, balance: result.balance, duplicate: result.duplicate });
 });
 

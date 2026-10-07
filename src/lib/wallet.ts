@@ -127,6 +127,38 @@ export async function chargeAI(ownerId: number, feature: string): Promise<{ bala
   });
 }
 
+type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/**
+ * Charges exactly `amount` from the wallet inside the caller's transaction,
+ * or throws WALLET_EMPTY (402) without charging anything when the balance is
+ * short. Used for one-off purchases paid from the wallet, e.g. unlocking
+ * Agri Doctor contact numbers.
+ */
+export async function chargeWalletInTx(
+  tx: Tx,
+  ownerId: number,
+  amount: number,
+  type: string,
+  feature: string,
+): Promise<{ balance: number }> {
+  let [row] = await tx
+    .select()
+    .from(walletBalancesTable)
+    .where(eq(walletBalancesTable.ownerId, ownerId))
+    .limit(1)
+    .for("update");
+  if (!row) [row] = await tx.insert(walletBalancesTable).values({ ownerId }).returning();
+  const balance = Number(row.balance || 0);
+  if (balance < amount) {
+    throw new WalletError("WALLET_EMPTY", `Your wallet needs ₹${amount} for this. Recharge your wallet to continue.`, balance, amount);
+  }
+  const newBalance = Math.round((balance - amount) * 100) / 100;
+  await tx.update(walletBalancesTable).set({ balance: String(newBalance), updatedAt: new Date() }).where(eq(walletBalancesTable.id, row.id));
+  await tx.insert(walletTransactionsTable).values({ ownerId, type, feature, amount: String(-amount) });
+  return { balance: newBalance };
+}
+
 /**
  * Route helper: pre-check credit and answer 402 when the wallet is too low.
  * Returns false when the response was already sent (route should return).
