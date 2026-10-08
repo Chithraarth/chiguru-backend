@@ -2,7 +2,6 @@ import { Router, type IRouter } from "express";
 import { eq, and, or, desc, sql } from "drizzle-orm";
 import { db, managersTable, farmProfileTable } from "../db";
 import { requireOwner } from "../middlewares/firebaseAuth";
-import { firebaseAuth } from "../lib/firebase-admin";
 import { logger } from "../lib/logger";
 import { canCreateManager, isSubscriptionActive } from "../services/entitlement.service";
 import { sendInviteEmail } from "../lib/invite-email";
@@ -162,9 +161,10 @@ router.patch("/managers/:id", requireOwner, async (req, res) => {
   res.json(updated);
 });
 
-// Remove a manager — frees their seat immediately. If they'd already signed
-// in, disable their Firebase account too so a cached/offline token can't keep
-// working against this farm.
+// Remove a manager — frees their seat immediately. Their access to this farm
+// ends with it: the auth middleware only honours "active" memberships, checked
+// on every request. Their sign-in itself is left alone - it is the same
+// account they use for their own farm.
 router.delete("/managers/:id", requireOwner, async (req, res) => {
   const id = Number(req.params.id);
   const [row] = await db
@@ -174,14 +174,6 @@ router.delete("/managers/:id", requireOwner, async (req, res) => {
   if (!row) {
     res.status(404).json({ message: "Manager not found", code: "NOT_FOUND" });
     return;
-  }
-
-  if (row.firebaseUid) {
-    try {
-      await firebaseAuth.updateUser(row.firebaseUid, { disabled: true });
-    } catch (err) {
-      logger.warn({ err, managerId: id }, "Could not disable manager's Firebase account");
-    }
   }
 
   await db
