@@ -1081,6 +1081,10 @@ router.get("/work-groups", async (req, res) => {
       loanTaken: workGroupsTable.loanTaken,
       loanNotes: workGroupsTable.loanNotes,
       upiId: workGroupsTable.upiId,
+      // The picking-bonus rule, so the attendance screen can price kg above
+      // the target without a second request.
+      harvestThresholdKg: workGroupsTable.harvestThresholdKg,
+      harvestBonusPerKg: workGroupsTable.harvestBonusPerKg,
       isActive: workGroupsTable.isActive,
       seasonClosed: workGroupsTable.seasonClosed,
       clearedAt: workGroupsTable.clearedAt,
