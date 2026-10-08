@@ -1081,6 +1081,10 @@ router.get("/work-groups", async (req, res) => {
       loanTaken: workGroupsTable.loanTaken,
       loanNotes: workGroupsTable.loanNotes,
       upiId: workGroupsTable.upiId,
+      // The picking-bonus rule, so the attendance screen can price kg above
+      // the target without a second request.
+      harvestThresholdKg: workGroupsTable.harvestThresholdKg,
+      harvestBonusPerKg: workGroupsTable.harvestBonusPerKg,
       isActive: workGroupsTable.isActive,
       seasonClosed: workGroupsTable.seasonClosed,
       clearedAt: workGroupsTable.clearedAt,
@@ -2026,6 +2030,7 @@ router.post("/attendance", requireActiveSubscription, async (req, res) => {
       Number(existing.overtimeHours ?? 0) !== Number(incoming.overtimeHours ?? 0) ||
       Number(existing.overtimeRate ?? 0) !== Number(incoming.overtimeRate ?? 0) ||
       Number(existing.harvestedKg ?? 0) !== Number(incoming.harvestedKg ?? 0) ||
+      (existing.harvestCrop ?? null) !== incoming.harvestCrop ||
       (existing.notes ?? null) !== incoming.notes;
     // Identical re-send = a harmless at-least-once replay, not a real conflict.
     if (!changed) return res.status(200).json(existing);
@@ -2048,6 +2053,7 @@ router.post("/attendance", requireActiveSubscription, async (req, res) => {
         wageAmount: String(existing.wageAmount),
         overtimeHours: existing.overtimeHours != null ? String(existing.overtimeHours) : null,
         harvestedKg: existing.harvestedKg != null ? String(existing.harvestedKg) : null,
+        harvestCrop: existing.harvestCrop ?? null,
         notes: existing.notes ?? null,
       },
       newValue: incoming,
