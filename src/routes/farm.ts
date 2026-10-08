@@ -1020,6 +1020,57 @@ router.get("/workers/:id/money", async (req, res) => {
   const totalEarned = totalWage;
   const netDue = totalEarned - loanOutstanding - paymentsTotal;
 
+  // Break each day's pay into base wage, overtime and picking bonus, so the
+  // owner sees what the extra was for. The bonus uses each group's picking
+  // rule (same as the bonus summary); the base wage is what's left of the
+  // saved wage, so the parts always add up to what was actually recorded.
+  const groupIds = [...new Set(attRows.map((r) => r.workGroupId))];
+  const groupRows = groupIds.length
+    ? await db
+        .select({
+          id: workGroupsTable.id,
+          name: workGroupsTable.name,
+          threshold: workGroupsTable.harvestThresholdKg,
+          perKg: workGroupsTable.harvestBonusPerKg,
+        })
+        .from(workGroupsTable)
+        .where(inArray(workGroupsTable.id, groupIds))
+    : [];
+  const groupById = new Map(groupRows.map((g) => [g.id, g]));
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+  const days = attRows
+    .map((r) => {
+      const g = groupById.get(r.workGroupId);
+      const threshold = Number(g?.threshold ?? 0);
+      const perKg = Number(g?.perKg ?? 0);
+      const kg = Number(r.harvestedKg ?? 0);
+      const kgAbove = threshold > 0 && perKg > 0 ? Math.max(0, kg - threshold) : 0;
+      const wage = Number(r.wageAmount ?? 0);
+      const overtimeAmount = Math.min(wage, Number(r.overtimeHours ?? 0) * Number(r.overtimeRate ?? 0));
+      const bonusAmount = Math.min(wage - overtimeAmount, kgAbove * perKg);
+      return {
+        date: r.date,
+        groupName: g?.name ?? null,
+        hoursWorked: Number(r.hoursWorked ?? 0),
+        overtimeHours: Number(r.overtimeHours ?? 0),
+        overtimeRate: Number(r.overtimeRate ?? 0),
+        harvestedKg: kg,
+        harvestCrop: r.harvestCrop ?? null,
+        targetKg: threshold > 0 && perKg > 0 ? threshold : null,
+        bonusPerKg: threshold > 0 && perKg > 0 ? perKg : null,
+        kgAboveTarget: kgAbove,
+        baseWage: round2(wage - overtimeAmount - bonusAmount),
+        overtimeAmount: round2(overtimeAmount),
+        bonusAmount: round2(bonusAmount),
+        total: round2(wage),
+      };
+    })
+    .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+  const totalBonusAmount = round2(days.reduce((s, d) => s + d.bonusAmount, 0));
+  const totalKgAboveTarget = days.reduce((s, d) => s + d.kgAboveTarget, 0);
+  const totalOvertimePaid = round2(days.reduce((s, d) => s + d.overtimeAmount, 0));
+  const totalBaseWage = round2(days.reduce((s, d) => s + d.baseWage, 0));
+
   return res.json({
     workerId,
     workerName: workers[0].name,
@@ -1030,6 +1081,11 @@ router.get("/workers/:id/money", async (req, res) => {
     totalOvertimeAmount,
     totalHarvestedKg,
     totalEarned,
+    totalBaseWage,
+    totalOvertimePaid,
+    totalBonusAmount,
+    totalKgAboveTarget,
+    days,
     lastWorkedDate,
     loanTaken,
     loanRepaid,
