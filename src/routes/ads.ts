@@ -14,7 +14,8 @@ const router = Router();
 // like the individual board reads. Contact details are deliberately left out —
 // tapping an ad opens its board where the full details live.
 router.get("/ads/recent", async (req, res) => {
-  const limit = Math.min(Math.max(Number(req.query.limit) || 8, 1), 20);
+  // Up to 100: the Shop screen lists every live ad, the home card a few.
+  const limit = Math.min(Math.max(Number(req.query.limit) || 8, 1), 100);
 
   const [hire, equipment, produce] = await Promise.all([
     db
