@@ -73,11 +73,39 @@ const EDITABLE_ESTATE_FIELDS = [
   "avgRainfallMm",
   "climateZone",
   "currency",
-  "payWeekStart",
+  "payCycle",
+  "payFrom",
+  "payTo",
+  "payToNextMonth",
 ] as const;
 
-function isWeekday(v: unknown): v is number {
-  return typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 6;
+/**
+ * A pay cycle is set as one unit: weekly from/to are weekdays (0-6), monthly
+ * from/to are days of the month (1-31). For a work group, payCycle null
+ * clears it back to the farm's cycle.
+ */
+function payCycleError(b: Record<string, unknown>, allowInherit: boolean): string | null {
+  const keys = ["payCycle", "payFrom", "payTo", "payToNextMonth"];
+  if (!keys.some((k) => k in b)) return null;
+  if (allowInherit && b.payCycle === null) {
+    b.payFrom = null;
+    b.payTo = null;
+    b.payToNextMonth = null;
+    return null;
+  }
+  const int = (v: unknown, lo: number, hi: number) => typeof v === "number" && Number.isInteger(v) && v >= lo && v <= hi;
+  if (b.payCycle === "weekly") {
+    if (!int(b.payFrom, 0, 6) || !int(b.payTo, 0, 6)) return "Weekly pay days must be 0 (Sunday) to 6 (Saturday)";
+    b.payToNextMonth = false;
+    return null;
+  }
+  if (b.payCycle === "monthly") {
+    if (!int(b.payFrom, 1, 31) || !int(b.payTo, 1, 31)) return "Monthly pay dates must be 1 to 31";
+    b.payToNextMonth = b.payToNextMonth === true;
+    if (!b.payToNextMonth && (b.payTo as number) < (b.payFrom as number)) return "The end date must be after the start date in the same month";
+    return null;
+  }
+  return "payCycle must be weekly or monthly";
 }
 
 function pickEstateFields(body: unknown, allowed: readonly string[] = EDITABLE_ESTATE_FIELDS) {
@@ -495,9 +523,8 @@ router.patch("/estates/:id", requireOwnerOrManager, async (req, res) => {
   }
   const fields = pickEstateFields(req.body, isInvitee ? ["farmName"] : EDITABLE_ESTATE_FIELDS);
   if (Object.keys(fields).length === 0) return res.status(400).json({ message: "Nothing to update" });
-  if ("payWeekStart" in fields && !isWeekday(fields.payWeekStart)) {
-    return res.status(400).json({ message: "payWeekStart must be 0 (Sunday) to 6 (Saturday)" });
-  }
+  const cycleError = payCycleError(fields, false);
+  if (cycleError) return res.status(400).json({ message: cycleError });
   const [row] = await db
     .update(farmProfileTable)
     .set({ ...fields, updatedAt: new Date() })
@@ -1147,7 +1174,10 @@ router.get("/work-groups", async (req, res) => {
       upiId: workGroupsTable.upiId,
       // The picking-bonus rule, so the attendance screen can price kg above
       // the target without a second request.
-      payWeekStart: workGroupsTable.payWeekStart,
+      payCycle: workGroupsTable.payCycle,
+      payFrom: workGroupsTable.payFrom,
+      payTo: workGroupsTable.payTo,
+      payToNextMonth: workGroupsTable.payToNextMonth,
       harvestThresholdKg: workGroupsTable.harvestThresholdKg,
       harvestBonusPerKg: workGroupsTable.harvestBonusPerKg,
       isActive: workGroupsTable.isActive,
@@ -1228,10 +1258,9 @@ router.get("/work-groups/:id", async (req, res) => {
 router.patch("/work-groups/:id", async (req, res) => {
   const eid = await activeEstateId(req);
   const { estateId: _ignore, ...body } = req.body ?? {};
-  // null = follow the farm's pay week.
-  if ("payWeekStart" in body && body.payWeekStart !== null && !isWeekday(body.payWeekStart)) {
-    return res.status(400).json({ message: "payWeekStart must be 0 (Sunday) to 6 (Saturday), or null" });
-  }
+  // payCycle null = follow the farm's pay cycle.
+  const cycleError = payCycleError(body, true);
+  if (cycleError) return res.status(400).json({ message: cycleError });
   if (!(await cropInEstate(body.cropId != null ? Number(body.cropId) : null, eid))) {
     return res.status(404).json({ message: "Crop not found" });
   }

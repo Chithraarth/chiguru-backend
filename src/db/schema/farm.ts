@@ -49,9 +49,14 @@ export const farmProfileTable = pgTable("farm_profile", {
   // Set automatically when the owner picks their country in the app menu; the
   // manager device reads it from here so both apps always match.
   currency: text("currency").notNull().default("INR"),
-  // Day the farm's pay week starts, 0 = Sunday ... 6 = Saturday (Sat-Fri,
-  // paid on Friday, by default). Work groups follow it unless they set their own.
-  payWeekStart: integer("pay_week_start").notNull().default(6),
+  // The farm's pay cycle, which work groups follow unless they set their own:
+  // "weekly" from weekday pay_from to weekday pay_to (0 = Sunday ... 6 =
+  // Saturday), or "monthly" from day pay_from to day pay_to of the same month
+  // (or of the next month when pay_to_next_month). Default: weekly Sat -> Fri.
+  payCycle: text("pay_cycle").notNull().default("weekly"),
+  payFrom: integer("pay_from").notNull().default(6),
+  payTo: integer("pay_to").notNull().default(5),
+  payToNextMonth: boolean("pay_to_next_month").notNull().default(false),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
@@ -161,8 +166,12 @@ export const workGroupsTable = pgTable("work_groups", {
   // Picking-bonus rule for this group: bonus per day = max(0, kg - threshold) * bonusPerKg.
   harvestThresholdKg: numeric("harvest_threshold_kg", { precision: 8, scale: 2 }),
   harvestBonusPerKg: numeric("harvest_bonus_per_kg", { precision: 8, scale: 2 }),
-  // This group's own pay-week start day (0-6), or null to follow the farm.
-  payWeekStart: integer("pay_week_start"),
+  // This group's own pay cycle (same meaning as on farm_profile), or
+  // pay_cycle null to follow the farm.
+  payCycle: text("pay_cycle"),
+  payFrom: integer("pay_from"),
+  payTo: integer("pay_to"),
+  payToNextMonth: boolean("pay_to_next_month"),
   isActive: boolean("is_active").notNull().default(true),
   // Soft delete → recycle bin. Non-null means "in the bin"; restorable for 30
   // days, then purged (with children) lazily by the bin endpoints.
