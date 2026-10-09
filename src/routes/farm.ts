@@ -73,7 +73,12 @@ const EDITABLE_ESTATE_FIELDS = [
   "avgRainfallMm",
   "climateZone",
   "currency",
+  "payWeekStart",
 ] as const;
+
+function isWeekday(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 6;
+}
 
 function pickEstateFields(body: unknown, allowed: readonly string[] = EDITABLE_ESTATE_FIELDS) {
   const src = (body ?? {}) as Record<string, unknown>;
@@ -490,6 +495,9 @@ router.patch("/estates/:id", requireOwnerOrManager, async (req, res) => {
   }
   const fields = pickEstateFields(req.body, isInvitee ? ["farmName"] : EDITABLE_ESTATE_FIELDS);
   if (Object.keys(fields).length === 0) return res.status(400).json({ message: "Nothing to update" });
+  if ("payWeekStart" in fields && !isWeekday(fields.payWeekStart)) {
+    return res.status(400).json({ message: "payWeekStart must be 0 (Sunday) to 6 (Saturday)" });
+  }
   const [row] = await db
     .update(farmProfileTable)
     .set({ ...fields, updatedAt: new Date() })
@@ -1139,6 +1147,7 @@ router.get("/work-groups", async (req, res) => {
       upiId: workGroupsTable.upiId,
       // The picking-bonus rule, so the attendance screen can price kg above
       // the target without a second request.
+      payWeekStart: workGroupsTable.payWeekStart,
       harvestThresholdKg: workGroupsTable.harvestThresholdKg,
       harvestBonusPerKg: workGroupsTable.harvestBonusPerKg,
       isActive: workGroupsTable.isActive,
@@ -1219,6 +1228,10 @@ router.get("/work-groups/:id", async (req, res) => {
 router.patch("/work-groups/:id", async (req, res) => {
   const eid = await activeEstateId(req);
   const { estateId: _ignore, ...body } = req.body ?? {};
+  // null = follow the farm's pay week.
+  if ("payWeekStart" in body && body.payWeekStart !== null && !isWeekday(body.payWeekStart)) {
+    return res.status(400).json({ message: "payWeekStart must be 0 (Sunday) to 6 (Saturday), or null" });
+  }
   if (!(await cropInEstate(body.cropId != null ? Number(body.cropId) : null, eid))) {
     return res.status(404).json({ message: "Crop not found" });
   }
