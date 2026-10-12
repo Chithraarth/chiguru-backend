@@ -70,6 +70,7 @@ const INVITEE_ROUTES: Route[] = [
   route("GET", "/farm/profile"),
   route("GET", "/crops"),
   route("GET", "/workers"),
+  route("POST", "/workers"), // add a worker to a group
   route("GET", "/work-groups"),
   route("POST", "/work-groups"),
   route("GET", "/work-groups/:id/advance-payments"),
