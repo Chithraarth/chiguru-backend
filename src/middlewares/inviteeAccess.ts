@@ -84,9 +84,26 @@ const INVITEE_ROUTES: Route[] = [
   route("GET", "/expenses"),
   route("POST", "/expenses"),
   route("GET", "/expenses/:id/receipt"),
-  // Count-from-photo keeps the photo as the day's work-session photo.
+  // The group's Attendance screen, same as the owner's: edit/remove workers,
+  // mark absent, picking-bonus target, overtime and picking-bonus settlement,
+  // work session (check-in/photos/check-out), advances, loans, season end.
+  route("PATCH", "/workers/:id"),
+  route("DELETE", "/workers/:id"),
+  route("DELETE", "/attendance/:id"),
+  route("PATCH", "/work-groups/:id"),
+  route("GET", "/work-groups/:id/overtime-summary"),
+  route("POST", "/work-groups/:id/overtime/settle"),
+  route("GET", "/work-groups/:id/harvest-bonus-summary"),
+  route("POST", "/work-groups/:id/harvest-bonus/settle"),
+  route("GET", "/work-groups/:id/sessions"),
   route("POST", "/work-groups/:id/sessions"),
   route("POST", "/work-sessions/:id/update-photo"),
+  route("POST", "/work-sessions/:id/checkout"),
+  route("POST", "/work-groups/:id/advance-payments"),
+  route("DELETE", "/work-groups/:id/advance-payments/:payId"),
+  route("POST", "/work-groups/:id/season-end"),
+  route("POST", "/loans"),
+  route("POST", "/loan-payments"),
   // Farm Accounts → Labour Payments & Records and Employee Attendance:
   // read wages/loans/payments and record a wage payment (no deleting).
   route("GET", "/workers/:id/money"),
