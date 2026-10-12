@@ -83,6 +83,16 @@ const INVITEE_ROUTES: Route[] = [
   route("GET", "/expenses"),
   route("POST", "/expenses"),
   route("GET", "/expenses/:id/receipt"),
+  // Count-from-photo keeps the photo as the day's work-session photo.
+  route("POST", "/work-groups/:id/sessions"),
+  route("POST", "/work-sessions/:id/update-photo"),
+  // Farm Accounts → Labour Payments & Records and Employee Attendance:
+  // read wages/loans/payments and record a wage payment (no deleting).
+  route("GET", "/workers/:id/money"),
+  route("GET", "/workers/:id/wages"),
+  route("GET", "/work-groups/:id/loans"),
+  route("GET", "/worker-payments"),
+  route("POST", "/worker-payments"),
 ];
 
 // The invitee's own account (never the inviting Owner's data): choosing an
