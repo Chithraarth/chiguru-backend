@@ -100,6 +100,9 @@ export const insertBlockSchema = createInsertSchema(blocksTable).omit({ id: true
 export const workersTable = pgTable("workers", {
   id: serial("id").primaryKey(),
   estateId: integer("estate_id").references(() => farmProfileTable.id),
+  // The work group this worker belongs to; only that group lists them.
+  // Null = not placed yet (shown in every group until first marked present).
+  workGroupId: integer("work_group_id").references(() => workGroupsTable.id),
   name: text("name").notNull(),
   phone: text("phone"),
   type: text("type").notNull(),
