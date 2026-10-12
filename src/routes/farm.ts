@@ -158,6 +158,12 @@ async function groupInEstate(groupId: number, eid: number | null): Promise<boole
 
 // Same estate check but including soft-deleted groups — only for the recycle
 // bin routes (restore / delete forever), which must reach binned groups.
+// A worker's group must be one of this farm's groups; anything else is "no group".
+async function ownGroupOrNull(raw: unknown, eid: number | null): Promise<number | null> {
+  const id = Number(raw);
+  return Number.isInteger(id) && id > 0 && (await groupInEstate(id, eid)) ? id : null;
+}
+
 async function binnedGroupInEstate(groupId: number, eid: number | null): Promise<boolean> {
   const [g] = await db
     .select({ id: workGroupsTable.id })
@@ -788,6 +794,7 @@ router.post("/workers", async (req, res) => {
     ...body,
     estateId: eid,
     clientId: typeof clientId === "string" && clientId.trim() !== "" ? clientId : null,
+    workGroupId: await ownGroupOrNull(body.workGroupId, eid),
   };
 
   // Idempotent replay: a flaky network can drop the response after the row
@@ -826,6 +833,7 @@ router.get("/workers/:id", async (req, res) => {
 router.patch("/workers/:id", async (req, res) => {
   const eid = await activeEstateId(req);
   const { estateId: _ignore, ...body } = req.body ?? {};
+  if ("workGroupId" in body) body.workGroupId = await ownGroupOrNull(body.workGroupId, eid);
   // faceDescriptor: JSON of one 128-number embedding, or up to 5 of them (multi-pose).
   if (body.faceDescriptor != null) {
     const is128 = (a: unknown) =>
@@ -1314,6 +1322,7 @@ async function hardDeleteWorkGroup(groupId: number) {
       .delete(groupWorkSessionsTable)
       .where(eq(groupWorkSessionsTable.workGroupId, groupId));
     await tx.update(loansTable).set({ workGroupId: null }).where(eq(loansTable.workGroupId, groupId));
+    await tx.update(workersTable).set({ workGroupId: null }).where(eq(workersTable.workGroupId, groupId));
     await tx
       .update(harvestsTable)
       .set({ workGroupId: null })
@@ -2184,6 +2193,11 @@ router.post("/attendance", requireActiveSubscription, async (req, res) => {
       set: { ...incoming, lastEditedBy: deviceLabel },
     })
     .returning();
+  // A worker not placed in a group yet joins the group they first work in.
+  await db
+    .update(workersTable)
+    .set({ workGroupId })
+    .where(and(eq(workersTable.id, workerId), isNull(workersTable.workGroupId)));
   return res.status(201).json(row);
 });
 
