@@ -16,6 +16,7 @@ import subscriptionRouter from "./subscription";
 import yearPlanRouter from "./year-plan";
 import pushRouter from "./push";
 import walletRouter from "./wallet";
+import moderationRouter from "./moderation";
 import { enforceAccessRules } from "../middlewares/inviteeAccess";
 
 const router: IRouter = Router();
@@ -40,5 +41,6 @@ router.use(errorsRouter);
 router.use(ownersRouter);
 router.use(subscriptionRouter);
 router.use(walletRouter);
+router.use(moderationRouter);
 
 export default router;

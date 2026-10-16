@@ -6,6 +6,8 @@ import {
   produceListingsTable,
 } from "../db";
 import { eq, desc } from "drizzle-orm";
+import { requestOwnerKey } from "../lib/owner-key";
+import { hiddenFor, visible } from "../lib/moderation";
 
 const router = Router();
 
@@ -21,6 +23,7 @@ router.get("/ads/recent", async (req, res) => {
     db
       .select({
         id: hireListingsTable.id,
+        ownerKey: hireListingsTable.ownerKey,
         title: hireListingsTable.title,
         listingType: hireListingsTable.listingType,
         place: hireListingsTable.district,
@@ -33,6 +36,7 @@ router.get("/ads/recent", async (req, res) => {
     db
       .select({
         id: equipmentListingsTable.id,
+        ownerKey: equipmentListingsTable.ownerKey,
         title: equipmentListingsTable.title,
         place: equipmentListingsTable.location,
         createdAt: equipmentListingsTable.createdAt,
@@ -44,6 +48,7 @@ router.get("/ads/recent", async (req, res) => {
     db
       .select({
         id: produceListingsTable.id,
+        ownerKey: produceListingsTable.ownerKey,
         title: produceListingsTable.productName,
         place: produceListingsTable.location,
         createdAt: produceListingsTable.createdAt,
@@ -53,9 +58,10 @@ router.get("/ads/recent", async (req, res) => {
       .orderBy(desc(produceListingsTable.createdAt))
       .limit(limit),
   ]);
+  const hidden = await hiddenFor(requestOwnerKey(req));
 
   const feed = [
-    ...hire.map((r) => ({
+    ...visible(hire, "hire", hidden).map((r) => ({
       id: `hire-${r.id}`,
       board: r.listingType === "job" ? "hire_job" : "hire_rental",
       title: r.title,
@@ -63,7 +69,7 @@ router.get("/ads/recent", async (req, res) => {
       createdAt: r.createdAt,
       href: `/workers?tab=${r.listingType === "job" ? "job" : "rental"}&ad=${r.id}`,
     })),
-    ...equipment.map((r) => ({
+    ...visible(equipment, "equipment", hidden).map((r) => ({
       id: `equipment-${r.id}`,
       board: "equipment",
       title: r.title,
@@ -71,7 +77,7 @@ router.get("/ads/recent", async (req, res) => {
       createdAt: r.createdAt,
       href: `/equipment?ad=${r.id}`,
     })),
-    ...produce.map((r) => ({
+    ...visible(produce, "produce", hidden).map((r) => ({
       id: `produce-${r.id}`,
       board: "produce",
       title: r.title,

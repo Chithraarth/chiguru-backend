@@ -52,6 +52,8 @@ const PUBLIC_ROUTES: Route[] = [
   route("PATCH", "/nursery/listings/:id"),
   route("DELETE", "/nursery/listings/:id"),
   route("GET", "/mandi/prices"),
+  // Reporting / blocking a listing on the open boards (keyed by device, no sign-in needed).
+  route("POST", "/content/report"),
 ];
 
 // Signed in, but not yet tied to any Owner's data — e.g. a first-time
