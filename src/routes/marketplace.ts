@@ -6,6 +6,7 @@ import { requestOwnerKey, publicRow, bodyOwnerKey } from "../lib/owner-key";
 import { requireOwner } from "../middlewares/firebaseAuth";
 import { requireActiveSubscription } from "../middlewares/subscriptionGate";
 
+import { hiddenFor, visible } from "../lib/moderation";
 const router = Router();
 
 const CATEGORIES = [
@@ -34,7 +35,8 @@ router.get("/produce-listings", async (req, res) => {
     .where(and(...filters))
     .orderBy(desc(produceListingsTable.createdAt))
     .limit(200);
-  return res.json(rows.map((r) => publicRow(r, callerKey)));
+  const hidden = await hiddenFor(callerKey);
+  return res.json(visible(rows, "produce", hidden).map((r) => publicRow(r, callerKey)));
 });
 
 router.get("/produce-listings/:id", async (req, res) => {

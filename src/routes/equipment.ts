@@ -6,6 +6,7 @@ import { requestOwnerKey, publicRow, bodyOwnerKey } from "../lib/owner-key";
 import { requireOwner } from "../middlewares/firebaseAuth";
 import { requireActiveSubscription } from "../middlewares/subscriptionGate";
 
+import { hiddenFor, visible } from "../lib/moderation";
 const router = Router();
 
 // Equipment types farmers buy/sell secondhand or new. Kept in sync with the
@@ -44,7 +45,8 @@ router.get("/equipment-listings", async (req, res) => {
     .where(and(...filters))
     .orderBy(desc(equipmentListingsTable.createdAt))
     .limit(200);
-  return res.json(rows.map((r) => publicRow(r, callerKey)));
+  const hidden = await hiddenFor(callerKey);
+  return res.json(visible(rows, "equipment", hidden).map((r) => publicRow(r, callerKey)));
 });
 
 router.get("/equipment-listings/:id", async (req, res) => {

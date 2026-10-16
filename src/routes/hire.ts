@@ -3,6 +3,7 @@ import { db } from "../db";
 import { hireListingsTable } from "../db";
 import { eq, and, desc } from "drizzle-orm";
 
+import { hiddenFor, visible } from "../lib/moderation";
 const router = Router();
 
 // Two sides of the Hire board. Kept in sync with the frontend lists; anything
@@ -64,7 +65,8 @@ router.get("/hire-listings", async (req, res) => {
     .where(and(...filters))
     .orderBy(desc(hireListingsTable.createdAt))
     .limit(300);
-  return res.json(rows.map((r) => publicRow(r, callerKey)));
+  const hidden = await hiddenFor(callerKey);
+  return res.json(visible(rows, "hire", hidden).map((r) => publicRow(r, callerKey)));
 });
 
 router.get("/hire-listings/:id", async (req, res) => {
