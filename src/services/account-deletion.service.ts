@@ -83,6 +83,8 @@ export async function deleteEstateData(tx: Tx, estateId: number) {
   await tx.delete(loansTable).where(eq(loansTable.estateId, estateId));
   // Harvests reference work groups, so they must go before the groups do.
   await tx.delete(harvestsTable).where(eq(harvestsTable.estateId, estateId));
+  // Workers point at their group too, so unlink them before the groups go.
+  await tx.update(workersTable).set({ workGroupId: null }).where(inArray(workersTable.workGroupId, groupIds));
   await tx.delete(workGroupsTable).where(eq(workGroupsTable.estateId, estateId));
   await tx.delete(workersTable).where(eq(workersTable.estateId, estateId));
 
